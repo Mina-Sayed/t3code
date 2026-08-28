@@ -210,7 +210,7 @@ function CommandPaletteResultRow(props: {
           {props.item.timestamp}
         </span>
       ) : null}
-      {shortcutLabel ? <CommandShortcut>{shortcutLabel}</CommandShortcut> : null}
+      {shortcutLabel ? <CommandShortcut className="hidden sm:inline-flex">{shortcutLabel}</CommandShortcut> : null}
       {props.item.kind === "submenu" ? (
         <ChevronRightIcon className="-me-0.5 ms-auto size-4 shrink-0 text-muted-foreground/70" />
       ) : null}
