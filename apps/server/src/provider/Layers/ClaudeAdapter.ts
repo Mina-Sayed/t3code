@@ -2259,7 +2259,9 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         }
       : undefined;
     const usageSnapshot: ThreadTokenUsageSnapshot | undefined =
-      latestAssistantSnapshot ?? updatedLastGood ?? resultIterationSnapshot;
+      latestAssistantSnapshot ??
+      updatedLastGood ??
+      (context.turnState?.compactedSinceLatestAssistantUsage ? undefined : resultIterationSnapshot);
 
     const turnState = context.turnState;
     if (!turnState) {
