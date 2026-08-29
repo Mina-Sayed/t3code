@@ -2259,7 +2259,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         }
       : undefined;
     const usageSnapshot: ThreadTokenUsageSnapshot | undefined =
-      contextUsageSnapshot ?? updatedLastGood ?? resultIterationSnapshot;
+      latestAssistantSnapshot ?? updatedLastGood ?? resultIterationSnapshot;
 
     const turnState = context.turnState;
     if (!turnState) {
