@@ -3034,6 +3034,96 @@ describe("ClaudeAdapterLive", () => {
   );
 
   it.effect(
+    "prevents cumulative result usage from overriding per-request context (regression #8594)",
+    () => {
+      const harness = makeHarness();
+      return Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
+
+        const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 9).pipe(
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+
+        yield* adapter.startSession({
+          threadId: THREAD_ID,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          runtimeMode: "full-access",
+        });
+
+        yield* adapter.sendTurn({
+          threadId: THREAD_ID,
+          input: "hello",
+          attachments: [],
+        });
+
+        harness.query.emit({
+          type: "system",
+          subtype: "task_progress",
+          task_id: "task-usage-seed-8594",
+          description: "Thinking",
+          usage: {
+            total_tokens: 112994,
+          },
+          session_id: "sdk-session-8594",
+          uuid: "task-progress-8594",
+        } as unknown as SDKMessage);
+
+        // Result carries cumulative session usage (CLI sums per-model accumulators
+        // without reset). Old code used it as active context -> clamped to 1M.
+        harness.query.emit({
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          duration_ms: 1234,
+          duration_api_ms: 1200,
+          num_turns: 1,
+          result: "done",
+          stop_reason: "end_turn",
+          session_id: "sdk-session-8594",
+          usage: {
+            input_tokens: 100000,
+            cache_creation_input_tokens: 50000,
+            cache_read_input_tokens: 2034473,
+            output_tokens: 18487,
+            total_tokens: 2202960,
+            iterations: [],
+          },
+          modelUsage: {
+            "claude-opus-4-6": {
+              contextWindow: 1000000,
+              maxOutputTokens: 64000,
+            },
+          },
+        } as unknown as SDKMessage);
+        harness.query.finish();
+
+        const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+        const usageEvents = runtimeEvents.filter(
+          (event) => event.type === "thread.token-usage.updated",
+        );
+        const finalUsageEvent = usageEvents.at(-1);
+        assert.equal(finalUsageEvent?.type, "thread.token-usage.updated");
+        if (finalUsageEvent?.type === "thread.token-usage.updated") {
+          // Per-request 112994 must be preserved; result only contributes
+          // totalProcessedTokens and maxTokens. Old precedence produced 1M.
+          assert.deepEqual(finalUsageEvent.payload, {
+            usage: {
+              usedTokens: 112994,
+              lastUsedTokens: 112994,
+              totalProcessedTokens: 2202960,
+              maxTokens: 1000000,
+            },
+          });
+        }
+      }).pipe(
+        Effect.provideService(Random.Random, makeDeterministicRandomService()),
+        Effect.provide(harness.layer),
+      );
+    },
+  );
+
+  it.effect(
     "emits completion only after turn result when assistant frames arrive before deltas",
     () => {
       const harness = makeHarness();
