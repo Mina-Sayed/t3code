@@ -2264,16 +2264,6 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       result?.usage && typeof result.usage === "object" && !Array.isArray(result.usage)
         ? (result.usage as Record<string, unknown>)
         : undefined;
-    const hasResultUsageIteration =
-      resultUsageRecord !== undefined && lastClaudeUsageIteration(resultUsageRecord) !== undefined;
-    const resultHasActiveUsage =
-      resultUsageRecord !== undefined &&
-      (hasResultUsageIteration ||
-        claudeUsageInputTokens(resultUsageRecord) + claudeUsageOutputTokens(resultUsageRecord) > 0);
-    const resultTotalOnly =
-      resultUsageRecord !== undefined &&
-      !resultHasActiveUsage &&
-      claudeTotalProcessedTokens(resultUsageRecord) !== undefined;
     const resultIterationSnapshot = resultUsageRecord
       ? normalizeClaudeActiveTokenUsage(
           resultUsageRecord,
@@ -2282,38 +2272,30 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         )
       : undefined;
     const lastGoodUsage = context.lastKnownTokenUsage;
+    // Fix #8594: result.usage is cumulative across the whole session (CLI sums
+    // per-model accumulators that are never reset), so it must not be used as
+    // the active context. With includePartialMessages:true every parent
+    // message_delta already updates lastKnownTokenUsage via
+    // normalizeClaudeActiveTokenUsage (~2473) with the per-request Beta usage
+    // (input+cache_read is the real active context). Prefer that authoritative
+    // per-request reading; keep result.usage only for totalProcessedTokens.
+    const updatedLastGood: ThreadTokenUsageSnapshot | undefined = lastGoodUsage
+      ? {
+          ...lastGoodUsage,
+          ...(typeof maxTokens === "number" && Number.isFinite(maxTokens) && maxTokens > 0
+            ? { maxTokens }
+            : {}),
+          ...(typeof accumulatedTotalProcessedTokens === "number" &&
+          Number.isFinite(accumulatedTotalProcessedTokens) &&
+          accumulatedTotalProcessedTokens > lastGoodUsage.usedTokens
+            ? {
+                totalProcessedTokens: accumulatedTotalProcessedTokens,
+              }
+            : {}),
+        }
+      : undefined;
     const usageSnapshot: ThreadTokenUsageSnapshot | undefined =
-      contextUsageSnapshot ??
-      (resultTotalOnly && lastGoodUsage
-        ? {
-            ...lastGoodUsage,
-            ...(typeof maxTokens === "number" && Number.isFinite(maxTokens) && maxTokens > 0
-              ? { maxTokens }
-              : {}),
-            ...(typeof accumulatedTotalProcessedTokens === "number" &&
-            Number.isFinite(accumulatedTotalProcessedTokens) &&
-            accumulatedTotalProcessedTokens > lastGoodUsage.usedTokens
-              ? {
-                  totalProcessedTokens: accumulatedTotalProcessedTokens,
-                }
-              : {}),
-          }
-        : resultIterationSnapshot) ??
-      (lastGoodUsage
-        ? {
-            ...lastGoodUsage,
-            ...(typeof maxTokens === "number" && Number.isFinite(maxTokens) && maxTokens > 0
-              ? { maxTokens }
-              : {}),
-            ...(typeof accumulatedTotalProcessedTokens === "number" &&
-            Number.isFinite(accumulatedTotalProcessedTokens) &&
-            accumulatedTotalProcessedTokens > lastGoodUsage.usedTokens
-              ? {
-                  totalProcessedTokens: accumulatedTotalProcessedTokens,
-                }
-              : {}),
-          }
-        : undefined);
+      contextUsageSnapshot ?? updatedLastGood ?? resultIterationSnapshot;
 
     const turnState = context.turnState;
     if (!turnState) {
