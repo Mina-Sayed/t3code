@@ -69,6 +69,7 @@ const runtimeMock = {
     abortImplementation: null as
       | ((sessionID: string, signal?: AbortSignal) => Promise<void>)
       | null,
+    abortError: null as Error | null,
     closeCalls: [] as string[],
     revertCalls: [] as Array<{ sessionID: string; messageID?: string }>,
     messageCalls: [] as Array<{ sessionID: string; messageID: string }>,
@@ -116,6 +117,7 @@ const runtimeMock = {
     this.state.abortCalls.length = 0;
     this.state.abortSignals.length = 0;
     this.state.abortImplementation = null;
+    this.state.abortError = null;
     this.state.closeCalls.length = 0;
     this.state.revertCalls.length = 0;
     this.state.messageCalls.length = 0;
@@ -249,6 +251,9 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
           runtimeMock.state.abortCalls.push(sessionID);
           if (options?.signal) {
             runtimeMock.state.abortSignals.push(options.signal);
+          }
+          if (runtimeMock.state.abortError) {
+            throw runtimeMock.state.abortError;
           }
           await runtimeMock.state.abortImplementation?.(sessionID, options?.signal);
         },
@@ -1349,6 +1354,61 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const session = sessions.find((entry) => entry.threadId === threadId);
       NodeAssert.equal(session?.status, "running");
       NodeAssert.equal(String(session?.activeTurnId), String(turn.turnId));
+    }),
+  );
+
+  it.effect("interrupt emits turn.aborted and returns session to ready", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-interrupt-ready");
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "write a very long story about space, 5000 words",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "anthropic/sonnet",
+        ),
+      });
+
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.take(4),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.interruptTurn(threadId);
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      const aborted = events.find((event) => event.type === "turn.aborted");
+      NodeAssert.ok(aborted);
+      if (aborted?.type === "turn.aborted") {
+        NodeAssert.equal(String(aborted.turnId), String(turn.turnId));
+      }
+
+      NodeAssert.deepEqual(runtimeMock.state.abortCalls, ["http://127.0.0.1:9999/session"]);
+      const sessions = yield* adapter.listSessions();
+      const session = sessions.find((entry) => entry.threadId === threadId);
+      NodeAssert.equal(session?.status, "ready");
+      NodeAssert.equal(session?.activeTurnId, undefined);
+
+      // Following turn can be sent after interrupt.
+      const nextTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "next prompt after interrupt",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "anthropic/sonnet",
+        ),
+      });
+      NodeAssert.ok(nextTurn.turnId);
+      NodeAssert.notEqual(String(nextTurn.turnId), String(turn.turnId));
     }),
   );
 
