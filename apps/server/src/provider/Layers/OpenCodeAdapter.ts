@@ -1560,20 +1560,40 @@ export function makeOpenCodeAdapter(
     const interruptTurn: OpenCodeAdapterShape["interruptTurn"] = Effect.fn("interruptTurn")(
       function* (threadId, turnId) {
         const context = yield* ensureSessionContext(sessions, threadId);
+        // Best-effort abort: even if the remote abort fails we still want to
+        // clear the local active-turn state so the session does not stay
+        // stuck in "running" (observed: turn "interrupted" but session still
+        // "running" with same activeTurnId, leaving Stop unusable).
         yield* runOpenCodeSdk("session.abort", () =>
           context.client.session.abort({ sessionID: context.openCodeSessionId }),
-        ).pipe(Effect.mapError(toRequestError));
-        if (turnId ?? context.activeTurnId) {
+        ).pipe(
+          Effect.catchAll((cause) =>
+            Effect.logWarning("OpenCode session.abort failed during interrupt", {
+              cause,
+              sessionID: context.openCodeSessionId,
+            }),
+          ),
+        );
+        const targetTurnId = turnId ?? context.activeTurnId;
+        if (targetTurnId) {
           yield* emit({
             ...(yield* buildEventBase({
               threadId,
-              turnId: turnId ?? context.activeTurnId,
+              turnId: targetTurnId,
             })),
             type: "turn.aborted",
             payload: {
               reason: "Interrupted by user.",
             },
           });
+        }
+        // Clear active turn so session returns to ready and next turn can be
+        // sent.
+        if (context.activeTurnId !== undefined) {
+          context.activeTurnId = undefined;
+          context.activeAgent = undefined;
+          context.activeVariant = undefined;
+          yield* updateProviderSession(context, { status: "ready" }, { clearActiveTurnId: true });
         }
       },
     );
