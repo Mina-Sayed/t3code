@@ -1560,21 +1560,29 @@ export function makeOpenCodeAdapter(
     const interruptTurn: OpenCodeAdapterShape["interruptTurn"] = Effect.fn("interruptTurn")(
       function* (threadId, turnId) {
         const context = yield* ensureSessionContext(sessions, threadId);
+        // Snapshot the active turn before the first yield: if a new turn
+        // starts while session.abort is awaiting, we must not emit/abort or
+        // clear that newer turn (observed race: turn "interrupted" but session
+        // still "running" with same activeTurnId left Stop unusable).
+        const snapshotActiveTurnId = context.activeTurnId;
+        const snapshotActiveAgent = context.activeAgent;
+        const snapshotActiveVariant = context.activeVariant;
+        void snapshotActiveAgent;
+        void snapshotActiveVariant;
+        const targetTurnId = turnId ?? snapshotActiveTurnId;
         // Best-effort abort: even if the remote abort fails we still want to
         // clear the local active-turn state so the session does not stay
-        // stuck in "running" (observed: turn "interrupted" but session still
-        // "running" with same activeTurnId, leaving Stop unusable).
+        // stuck in "running".
         yield* runOpenCodeSdk("session.abort", () =>
           context.client.session.abort({ sessionID: context.openCodeSessionId }),
         ).pipe(
-          Effect.catchAll((cause) =>
+          Effect.catch((cause) =>
             Effect.logWarning("OpenCode session.abort failed during interrupt", {
               cause,
               sessionID: context.openCodeSessionId,
             }),
           ),
         );
-        const targetTurnId = turnId ?? context.activeTurnId;
         if (targetTurnId) {
           yield* emit({
             ...(yield* buildEventBase({
@@ -1587,9 +1595,10 @@ export function makeOpenCodeAdapter(
             },
           });
         }
-        // Clear active turn so session returns to ready and next turn can be
-        // sent.
-        if (context.activeTurnId !== undefined) {
+        // Clear only if the active turn still matches the snapshot we
+        // interrupted — a newer turn may have started while abort was in
+        // flight and must not be cleared.
+        if (context.activeTurnId !== undefined && context.activeTurnId === snapshotActiveTurnId) {
           context.activeTurnId = undefined;
           context.activeAgent = undefined;
           context.activeVariant = undefined;
