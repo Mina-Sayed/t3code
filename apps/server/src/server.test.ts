@@ -57,6 +57,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -110,6 +111,7 @@ import {
 } from "./ws.ts";
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as GitManager from "./git/GitManager.ts";
+import * as EnvironmentTheme from "./environmentTheme.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
@@ -394,6 +396,7 @@ const buildAppUnderTest = (options?: {
   config?: Partial<ServerConfig.ServerConfig["Service"]>;
   layers?: {
     keybindings?: Partial<Keybindings.Keybindings["Service"]>;
+    environmentTheme?: Partial<EnvironmentTheme.EnvironmentThemeService["Service"]>;
     providerRegistry?: Partial<ProviderRegistry.ProviderRegistry["Service"]>;
     providerService?: Partial<ProviderService.ProviderService["Service"]>;
     serverSettings?: Partial<ServerSettings.ServerSettingsService["Service"]>;
@@ -629,14 +632,21 @@ const buildAppUnderTest = (options?: {
       },
     ).pipe(
       Layer.provide(
-        Layer.mock(Keybindings.Keybindings)({
-          loadConfigState: Effect.succeed({
-            keybindings: [],
-            issues: [],
+        Layer.mergeAll(
+          Layer.mock(Keybindings.Keybindings)({
+            loadConfigState: Effect.succeed({
+              keybindings: [],
+              issues: [],
+            }),
+            streamChanges: Stream.empty,
+            ...options?.layers?.keybindings,
           }),
-          streamChanges: Stream.empty,
-          ...options?.layers?.keybindings,
-        }),
+          Layer.mock(EnvironmentTheme.EnvironmentThemeService)({
+            current: Effect.succeed([]),
+            streamChanges: Stream.empty,
+            ...options?.layers?.environmentTheme,
+          }),
+        ),
       ),
       Layer.provide(
         Layer.mergeAll(
@@ -4918,6 +4928,51 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("refreshes providers for each subscribeServerConfig connection", () =>
+    Effect.gen(function* () {
+      const refreshCalls = yield* Ref.make(0);
+      const firstRefreshDone = yield* Deferred.make<void>();
+      const secondRefreshDone = yield* Deferred.make<void>();
+
+      yield* buildAppUnderTest({
+        layers: {
+          providerRegistry: {
+            refresh: () =>
+              Ref.updateAndGet(refreshCalls, (count) => count + 1).pipe(
+                Effect.tap((count) =>
+                  Deferred.succeed(
+                    count === 1 ? firstRefreshDone : secondRefreshDone,
+                    undefined,
+                  ).pipe(Effect.ignore),
+                ),
+                Effect.as([]),
+              ),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            yield* client[WS_METHODS.subscribeServerConfig]({}).pipe(Stream.runHead);
+            yield* Deferred.await(firstRefreshDone);
+          }),
+        ),
+      );
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            yield* client[WS_METHODS.subscribeServerConfig]({}).pipe(Stream.runHead);
+            yield* Deferred.await(secondRefreshDone);
+          }),
+        ),
+      );
+
+      assert.equal(yield* Ref.get(refreshCalls), 2);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("routes websocket resource telemetry through the subscription", () =>
     Effect.gen(function* () {
       yield* buildAppUnderTest();
@@ -4932,6 +4987,84 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assertTrue(Option.isSome(snapshot));
       assert.equal(snapshot.value.processes.length, 0);
       assert.equal(snapshot.value.groups.backend.processCount, 0);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  // An already-shipped client decodes this stream against an event union
+  // without environmentThemesUpdated, so an ungated emit would kill its whole
+  // config subscription. Opting in is the only way to receive them.
+  it.effect("subscribeServerConfig sends published themes to an opt-in subscriber", () =>
+    Effect.gen(function* () {
+      const themes = [
+        {
+          id: "nightfall",
+          name: "Nightfall",
+          appearance: "dark" as const,
+          canvas: "#1a1b26",
+          accent: "#7aa2f7",
+        },
+      ] as const;
+
+      yield* buildAppUnderTest({
+        layers: {
+          environmentTheme: {
+            current: Effect.succeed(themes),
+            streamChanges: Stream.succeed(themes),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const events = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.subscribeServerConfig]({ environmentThemes: true }).pipe(
+            Stream.take(2),
+            Stream.runCollect,
+          ),
+        ),
+      );
+
+      const [first, second] = Array.from(events);
+      assert.equal(first?.type, "snapshot");
+      // Not in the snapshot as well, or every opt-in client receives the same
+      // array twice on every connect.
+      if (first?.type === "snapshot") assert.equal(first.config.environmentThemes, undefined);
+      assert.equal(second?.type, "environmentThemesUpdated");
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("subscribeServerConfig withholds published themes from other subscribers", () =>
+    Effect.gen(function* () {
+      const themes = [
+        {
+          id: "nightfall",
+          name: "Nightfall",
+          appearance: "dark" as const,
+          canvas: "#1a1b26",
+          accent: "#7aa2f7",
+        },
+      ] as const;
+
+      yield* buildAppUnderTest({
+        layers: {
+          environmentTheme: {
+            current: Effect.succeed(themes),
+            streamChanges: Stream.succeed(themes),
+          },
+          providerRegistry: { streamChanges: Stream.empty },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const events = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.subscribeServerConfig]({}).pipe(Stream.take(1), Stream.runCollect),
+        ),
+      );
+
+      const first = Array.from(events)[0];
+      assert.equal(first?.type, "snapshot");
+      if (first?.type === "snapshot") assert.equal(first.config.environmentThemes, undefined);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
