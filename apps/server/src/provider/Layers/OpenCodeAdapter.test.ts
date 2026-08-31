@@ -5260,6 +5260,109 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("does not double count duplicate message.updated for same id", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-dedupe-usage");
+      const firstMessage = promiseWithResolvers<unknown>();
+      const secondMessage = promiseWithResolvers<unknown>();
+      const idleEvent = promiseWithResolvers<unknown>();
+      runtimeMock.state.subscribedEvents = [
+        firstMessage.promise,
+        secondMessage.promise,
+        idleEvent.promise,
+      ];
+
+      const turnCompletedFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId && event.type === "turn.completed"),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "test dedupe",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "opencode/mimo-test",
+        ),
+      });
+
+      firstMessage.resolve({
+        id: "evt-dedupe-1",
+        type: "message.updated",
+        properties: {
+          sessionID: "http://127.0.0.1:9999/session",
+          info: {
+            id: "msg_dedupe",
+            role: "assistant",
+            tokens: { input: 100, output: 20, reasoning: 5, cache: { read: 10, write: 2 } },
+            cost: 0.001,
+            modelID: "mimo-test",
+            providerID: "opencode",
+          },
+        },
+      });
+
+      yield* Effect.yieldNow;
+
+      // Same message id, updated tokens (cumulative) — should replace, not sum
+      secondMessage.resolve({
+        id: "evt-dedupe-2",
+        type: "message.updated",
+        properties: {
+          sessionID: "http://127.0.0.1:9999/session",
+          info: {
+            id: "msg_dedupe",
+            role: "assistant",
+            tokens: { input: 150, output: 30, reasoning: 10, cache: { read: 15, write: 3 } },
+            cost: 0.002,
+            modelID: "mimo-test",
+            providerID: "opencode",
+          },
+        },
+      });
+
+      yield* Effect.yieldNow;
+
+      idleEvent.resolve({
+        id: "evt-dedupe-idle",
+        type: "session.status",
+        properties: {
+          sessionID: "http://127.0.0.1:9999/session",
+          status: { type: "idle" },
+        },
+      });
+
+      const events = Array.from(
+        yield* Fiber.join(turnCompletedFiber).pipe(Effect.timeout("1 second")),
+      );
+      NodeAssert.equal(events.length, 1);
+      const payload = (events[0] as { payload: Record<string, unknown> }).payload;
+      const usage = payload.usage as {
+        input: number;
+        output: number;
+        cache: { read: number; write: number };
+      };
+      // Should be latest snapshot, not sum of both (100+150)
+      NodeAssert.equal(usage.input, 150);
+      NodeAssert.equal(usage.output, 30);
+      NodeAssert.equal(usage.cache.read, 15);
+      // Cost should be latest as well (deduped) — 0.002 not 0.003
+      // For deduped message, cost is replaced, so total is 0.002
+      NodeAssert.equal(payload.totalCostUsd as number, 0.002);
+      NodeAssert.equal(String((events[0] as { turnId: unknown }).turnId), String(turn.turnId));
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("keeps the event pump alive when native event logging fails", () =>
     Effect.gen(function* () {
       runtimeMock.state.subscribedEvents = [
