@@ -993,9 +993,10 @@ export function makeOpenCodeAdapter(
       tokens: OpenCodeTokens,
       turnId: TurnId | undefined,
       raw: unknown,
+      cost?: unknown,
+      model?: unknown,
+      providerId?: unknown,
     ) {
-      // Remember for turn.completed
-      context.lastTokens = tokens;
       if (
         tokens.input + tokens.output + tokens.cache.read + tokens.cache.write === 0 &&
         tokens.total === undefined
@@ -1004,6 +1005,11 @@ export function makeOpenCodeAdapter(
       }
       const snapshot = openCodeTokensToSnapshot(tokens);
       if (snapshot.usedTokens <= 0) return;
+      // Remember for turn.completed only after validating non-zero tokens.
+      // This prevents zero-token events from overwriting previous valid usage
+      // and ensures cost/model are not leaked on empty turns.
+      context.lastTokens = tokens;
+      rememberOpenCodeCostAndModel(context, cost, model, providerId);
       yield* emit({
         ...(yield* buildEventBase({
           threadId: context.session.threadId,
@@ -1261,6 +1267,10 @@ export function makeOpenCodeAdapter(
       context.activeVariant = undefined;
       context.awaitingBusyAfterInterruption = false;
       context.reconcileIdleStatus = false;
+      // Clear pending usage so it does not leak to the next turn.
+      context.lastTokens = null;
+      context.lastCost = null;
+      context.lastModel = null;
       yield* updateProviderSession(
         context,
         { status: "error", lastError: detail },
@@ -1453,6 +1463,10 @@ export function makeOpenCodeAdapter(
       if (cancellation) {
         context.cancellation = undefined;
       }
+      // Clear any pending usage so it does not leak to the next turn.
+      context.lastTokens = null;
+      context.lastCost = null;
+      context.lastModel = null;
       if (context.activeTurnId === turnId) {
         context.activeTurnId = undefined;
         context.activeAgent = undefined;
@@ -2091,13 +2105,15 @@ export function makeOpenCodeAdapter(
             const info = event.properties.info as unknown as Record<string, unknown>;
             const tokens = readOpenCodeTokens(info.tokens);
             if (tokens) {
-              rememberOpenCodeCostAndModel(
+              yield* emitOpenCodeTokenUsage(
                 context,
+                tokens,
+                turnId,
+                event,
                 info.cost,
                 (info.modelID as string | undefined) ?? (info.model as unknown),
                 info.providerID as string | undefined,
               );
-              yield* emitOpenCodeTokenUsage(context, tokens, turnId, event);
             }
           }
           break;
@@ -2166,13 +2182,15 @@ export function makeOpenCodeAdapter(
             const partRecord = part as unknown as Record<string, unknown>;
             const tokens = readOpenCodeTokens(partRecord.tokens);
             if (tokens) {
-              rememberOpenCodeCostAndModel(
+              yield* emitOpenCodeTokenUsage(
                 context,
+                tokens,
+                turnId,
+                event,
                 partRecord.cost,
                 (partRecord.modelID as string | undefined) ?? (partRecord.model as unknown),
                 partRecord.providerID as string | undefined,
               );
-              yield* emitOpenCodeTokenUsage(context, tokens, turnId, event);
             }
           }
 
@@ -2331,6 +2349,10 @@ export function makeOpenCodeAdapter(
           context.activeAgent = undefined;
           context.activeVariant = undefined;
           context.reconcileIdleStatus = false;
+          // Clear pending usage so it does not leak to the next turn.
+          context.lastTokens = null;
+          context.lastCost = null;
+          context.lastModel = null;
           yield* updateProviderSession(
             context,
             {
@@ -2394,20 +2416,29 @@ export function makeOpenCodeAdapter(
                 (props.providerID as string | undefined) ??
                 (props.info as Record<string, unknown> | undefined)?.providerID ??
                 (props.part as Record<string, unknown> | undefined)?.providerID;
-              rememberOpenCodeCostAndModel(context, cost, model, providerId);
-              yield* emitOpenCodeTokenUsage(context, tokens, turnId, event);
+              yield* emitOpenCodeTokenUsage(
+                context,
+                tokens,
+                turnId,
+                event,
+                cost,
+                model,
+                providerId,
+              );
             } else {
               const data = props.data as Record<string, unknown> | undefined;
               if (data) {
                 const nestedTokens = readOpenCodeTokens(data.tokens);
                 if (nestedTokens) {
-                  rememberOpenCodeCostAndModel(
+                  yield* emitOpenCodeTokenUsage(
                     context,
+                    nestedTokens,
+                    turnId,
+                    event,
                     data.cost,
                     (data.modelID as string | undefined) ?? (data.model as unknown),
                     data.providerID as string | undefined,
                   );
-                  yield* emitOpenCodeTokenUsage(context, nestedTokens, turnId, event);
                 }
               }
             }

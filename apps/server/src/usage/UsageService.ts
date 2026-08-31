@@ -311,7 +311,13 @@ export const make = Effect.gen(function* () {
       return records;
     });
 
-  /** Parses the OpenCode SQLite DB, reusing cached result when unchanged. */
+  /**
+   * Parses the OpenCode SQLite DB, reusing cached result when unchanged.
+   * `readOpenCodeDbRecords` yields to the event loop every 100 rows via
+   * `setImmediate`, so a cold scan of ~4k messages does not block the server
+   * (observed 7 daily buckets from 4085 messages). The `size`/`mtimeMs`
+   * fingerprint includes the WAL file, so WAL-only writes invalidate the cache.
+   */
   const readOpenCodeDbRecordsCached = (
     dbPath: string,
     size: number,

@@ -109,23 +109,27 @@ export async function readOpenCodeDbRecords(
     for (const table of tables) {
       try {
         // Use iterate() instead of all() to avoid loading all rows at once and to allow yielding.
+        // Keep the prepared statement alive for the duration of the iteration to avoid
+        // finalization mid-scan when yielding (node:sqlite finalizes statements that lose
+        // their JS reference during an async pause).
         let rows: Iterable<Record<string, unknown>>;
         let isSessionMessage = table === "session_message";
+        let stmt: ReturnType<InstanceType<typeof DatabaseSync>["prepare"]> | null = null;
         try {
           if (isSessionMessage) {
-            const stmt = db.prepare(
+            stmt = db.prepare(
               `SELECT id, session_id, type, time_created, time_updated, data FROM "${table}"`,
             );
             rows = stmt.iterate() as Iterable<Record<string, unknown>>;
           } else {
-            const stmt = db.prepare(
+            stmt = db.prepare(
               `SELECT id, session_id, time_created, time_updated, data FROM "${table}"`,
             );
             rows = stmt.iterate() as Iterable<Record<string, unknown>>;
           }
         } catch {
           // Fallback for older schemas without time columns
-          const stmt = db.prepare(`SELECT id, session_id, data FROM "${table}"`);
+          stmt = db.prepare(`SELECT id, session_id, data FROM "${table}"`);
           rows = stmt.iterate() as Iterable<Record<string, unknown>>;
           isSessionMessage = false;
         }
@@ -154,6 +158,8 @@ export async function readOpenCodeDbRecords(
             await new Promise<void>((resolve) => setImmediate(resolve));
           }
         }
+        // Retain reference to stmt until iteration completes (see comment above).
+        void stmt;
       } catch {
         // One table failing shouldn't hide the other; treat as empty for that table.
         continue;

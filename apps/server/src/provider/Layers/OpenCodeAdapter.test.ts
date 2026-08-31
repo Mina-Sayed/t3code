@@ -4952,6 +4952,208 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("emits thread.token-usage.updated on message.updated with tokens", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-token-usage");
+      const messageUpdatedEvent = promiseWithResolvers<unknown>();
+      runtimeMock.state.subscribedEvents = [messageUpdatedEvent.promise];
+
+      const tokenUsageFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter(
+          (event) => event.threadId === threadId && event.type === "thread.token-usage.updated",
+        ),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId,
+        input: "test tokens",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "opencode/mimo-test",
+        ),
+      });
+
+      messageUpdatedEvent.resolve({
+        id: "evt-token-usage",
+        type: "message.updated",
+        properties: {
+          sessionID: "http://127.0.0.1:9999/session",
+          info: {
+            id: "msg_token",
+            role: "assistant",
+            tokens: { input: 100, output: 50, reasoning: 10, cache: { read: 20, write: 5 } },
+            cost: 0.002,
+            modelID: "mimo-test",
+            providerID: "opencode",
+          },
+        },
+      });
+
+      const events = Array.from(
+        yield* Fiber.join(tokenUsageFiber).pipe(Effect.timeout("1 second")),
+      );
+      NodeAssert.equal(events.length, 1);
+      const usage = (events[0] as { payload: { usage: Record<string, unknown> } }).payload.usage;
+      NodeAssert.equal((usage as { inputTokens: number }).inputTokens, 100);
+      NodeAssert.equal((usage as { cachedInputTokens: number }).cachedInputTokens, 20);
+      NodeAssert.equal((usage as { outputTokens: number }).outputTokens, 50);
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("does not emit token usage on zero-token payload", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-zero-token");
+      const messageUpdatedEvent = promiseWithResolvers<unknown>();
+      const idleEvent = promiseWithResolvers<unknown>();
+      runtimeMock.state.subscribedEvents = [messageUpdatedEvent.promise, idleEvent.promise];
+
+      const turnCompletedFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId && event.type === "turn.completed"),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "zero tokens",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "opencode/mimo-test",
+        ),
+      });
+
+      messageUpdatedEvent.resolve({
+        id: "evt-zero-token",
+        type: "message.updated",
+        properties: {
+          sessionID: "http://127.0.0.1:9999/session",
+          info: {
+            id: "msg_zero",
+            role: "assistant",
+            tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+            cost: 0,
+            modelID: "mimo-test",
+            providerID: "opencode",
+          },
+        },
+      });
+
+      yield* Effect.yieldNow;
+
+      idleEvent.resolve({
+        id: "evt-zero-idle",
+        type: "session.status",
+        properties: {
+          sessionID: "http://127.0.0.1:9999/session",
+          status: { type: "idle" },
+        },
+      });
+
+      const events = Array.from(
+        yield* Fiber.join(turnCompletedFiber).pipe(Effect.timeout("1 second")),
+      );
+      NodeAssert.equal(events.length, 1);
+      const payload = (events[0] as { payload: Record<string, unknown> }).payload;
+      NodeAssert.equal(payload.usage, undefined);
+      NodeAssert.equal(String((events[0] as { turnId: unknown }).turnId), String(turn.turnId));
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("idle turn completion carries usage and modelUsage", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-idle-usage");
+      const messageUpdatedEvent = promiseWithResolvers<unknown>();
+      const idleEvent = promiseWithResolvers<unknown>();
+      runtimeMock.state.subscribedEvents = [messageUpdatedEvent.promise, idleEvent.promise];
+
+      const turnCompletedFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId && event.type === "turn.completed"),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "test idle usage",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "opencode/mimo-test",
+        ),
+      });
+
+      messageUpdatedEvent.resolve({
+        id: "evt-idle-usage-msg",
+        type: "message.updated",
+        properties: {
+          sessionID: "http://127.0.0.1:9999/session",
+          info: {
+            id: "msg_idle",
+            role: "assistant",
+            tokens: { input: 100, output: 20, reasoning: 5, cache: { read: 10, write: 2 } },
+            cost: 0.001,
+            modelID: "mimo-test",
+            providerID: "opencode",
+          },
+        },
+      });
+
+      // Yield to let token emission be processed
+      yield* Effect.yieldNow;
+
+      idleEvent.resolve({
+        id: "evt-idle-usage-idle",
+        type: "session.status",
+        properties: {
+          sessionID: "http://127.0.0.1:9999/session",
+          status: { type: "idle" },
+        },
+      });
+
+      const events = Array.from(
+        yield* Fiber.join(turnCompletedFiber).pipe(Effect.timeout("1 second")),
+      );
+      NodeAssert.equal(events.length, 1);
+      const payload = (events[0] as { payload: Record<string, unknown> }).payload;
+      NodeAssert.equal(payload.state, "completed");
+      NodeAssert.ok(payload.usage);
+      NodeAssert.equal(payload.totalCostUsd as number, 0.001);
+      const modelUsage = payload.modelUsage as Record<string, unknown>;
+      NodeAssert.ok(modelUsage["opencode/mimo-test"]);
+
+      // Ensure turnId matches
+      NodeAssert.equal(String((events[0] as { turnId: unknown }).turnId), String(turn.turnId));
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("keeps the event pump alive when native event logging fails", () =>
     Effect.gen(function* () {
       runtimeMock.state.subscribedEvents = [
