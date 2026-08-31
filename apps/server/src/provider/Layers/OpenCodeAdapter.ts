@@ -350,6 +350,8 @@ interface OpenCodeSessionContext {
   >;
   /** Counter for generic token events without a stable id. */
   dedupeCounter: number;
+  /** Persistent map from dedupeKey to the turn that created it, for stale-event detection. */
+  messageTurnMap: Map<string, TurnId>;
   cancellation: OpenCodeCancellation | undefined;
   interruptedTurnId: TurnId | undefined;
   reconcileIdleStatus: boolean;
@@ -1070,6 +1072,28 @@ export function makeOpenCodeAdapter(
               ? record.provider
               : "opencode";
         if (id) modelKey = `${prov}/${id}`;
+      }
+      // Stale-event guard: if this dedupeKey was already seen for a different
+      // turn, this is a late event from a prior turn that would otherwise
+      // contaminate the new turn's totals.
+      if (dedupeKey) {
+        const existingTurnId = context.messageTurnMap.get(dedupeKey);
+        if (existingTurnId !== undefined) {
+          if (existingTurnId !== turnId) {
+            yield* emit({
+              ...(yield* buildEventBase({
+                threadId: context.session.threadId,
+                turnId,
+                raw,
+              })),
+              type: "thread.token-usage.updated",
+              payload: { usage: snapshot },
+            });
+            return;
+          }
+        } else {
+          context.messageTurnMap.set(dedupeKey, turnId);
+        }
       }
       const key = dedupeKey ?? `generic:${context.dedupeCounter++}`;
       context.tokenDedupeMap.set(key, { tokens, cost: costValue, modelKey });
@@ -2788,6 +2812,7 @@ export function makeOpenCodeAdapter(
           modelUsage: new Map(),
           tokenDedupeMap: new Map(),
           dedupeCounter: 0,
+          messageTurnMap: new Map(),
           cancellation: undefined,
           interruptedTurnId: undefined,
           reconcileIdleStatus: false,

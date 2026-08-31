@@ -163,8 +163,7 @@ export async function readOpenCodeDbRecords(
         // Retain reference to stmt until iteration completes (see comment above).
         void stmt;
       } catch {
-        // One table failing shouldn't hide the other; treat as empty for that table.
-        continue;
+        return null;
       }
     }
     return records;
