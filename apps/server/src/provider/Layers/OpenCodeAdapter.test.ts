@@ -5154,6 +5154,112 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("accumulates usage and cost across multiple tool steps", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-accumulated-usage");
+      const firstMessage = promiseWithResolvers<unknown>();
+      const secondMessage = promiseWithResolvers<unknown>();
+      const idleEvent = promiseWithResolvers<unknown>();
+      runtimeMock.state.subscribedEvents = [
+        firstMessage.promise,
+        secondMessage.promise,
+        idleEvent.promise,
+      ];
+
+      const turnCompletedFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId && event.type === "turn.completed"),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "test accumulation",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "opencode/mimo-test",
+        ),
+      });
+
+      firstMessage.resolve({
+        id: "evt-accum-1",
+        type: "message.updated",
+        properties: {
+          sessionID: "http://127.0.0.1:9999/session",
+          info: {
+            id: "msg_accum_1",
+            role: "assistant",
+            tokens: { input: 100, output: 20, reasoning: 5, cache: { read: 10, write: 2 } },
+            cost: 0.001,
+            modelID: "mimo-test",
+            providerID: "opencode",
+          },
+        },
+      });
+
+      yield* Effect.yieldNow;
+
+      secondMessage.resolve({
+        id: "evt-accum-2",
+        type: "message.updated",
+        properties: {
+          sessionID: "http://127.0.0.1:9999/session",
+          info: {
+            id: "msg_accum_2",
+            role: "assistant",
+            tokens: { input: 50, output: 30, reasoning: 10, cache: { read: 5, write: 1 } },
+            cost: 0.002,
+            modelID: "mimo-test",
+            providerID: "opencode",
+          },
+        },
+      });
+
+      yield* Effect.yieldNow;
+
+      idleEvent.resolve({
+        id: "evt-accum-idle",
+        type: "session.status",
+        properties: {
+          sessionID: "http://127.0.0.1:9999/session",
+          status: { type: "idle" },
+        },
+      });
+
+      const events = Array.from(
+        yield* Fiber.join(turnCompletedFiber).pipe(Effect.timeout("1 second")),
+      );
+      NodeAssert.equal(events.length, 1);
+      const payload = (events[0] as { payload: Record<string, unknown> }).payload;
+      const usage = payload.usage as {
+        input: number;
+        output: number;
+        reasoning: number;
+        cache: { read: number; write: number };
+      };
+      // Input 100+50, output 20+30, cache read 10+5, write 2+1
+      NodeAssert.equal(usage.input, 150);
+      NodeAssert.equal(usage.output, 50);
+      NodeAssert.equal(usage.cache.read, 15);
+      NodeAssert.equal(usage.cache.write, 3);
+      // Cost summed
+      NodeAssert.equal(payload.totalCostUsd as number, 0.003);
+      const modelUsage = payload.modelUsage as Record<string, typeof usage>;
+      NodeAssert.ok(modelUsage["opencode/mimo-test"]);
+      NodeAssert.equal(modelUsage["opencode/mimo-test"].input, 150);
+      NodeAssert.equal(String((events[0] as { turnId: unknown }).turnId), String(turn.turnId));
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("keeps the event pump alive when native event logging fails", () =>
     Effect.gen(function* () {
       runtimeMock.state.subscribedEvents = [

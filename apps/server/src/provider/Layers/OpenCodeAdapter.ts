@@ -341,6 +341,8 @@ interface OpenCodeSessionContext {
   lastTokens: OpenCodeTokens | null;
   lastCost: number | null;
   lastModel: string | null;
+  /** Accumulated per-model tokens for the active turn, for `modelUsage`. */
+  modelUsage: Map<string, OpenCodeTokens>;
   cancellation: OpenCodeCancellation | undefined;
   interruptedTurnId: TurnId | undefined;
   reconcileIdleStatus: boolean;
@@ -696,6 +698,19 @@ function openCodeTokensToSnapshot(tokens: OpenCodeTokens): {
   };
 }
 
+function mergeOpenCodeTokens(a: OpenCodeTokens, b: OpenCodeTokens): OpenCodeTokens {
+  const totalA = a.total ?? a.input + a.output + a.cache.read + a.cache.write;
+  const totalB = b.total ?? b.input + b.output + b.cache.read + b.cache.write;
+  const hasTotal = a.total !== undefined || b.total !== undefined;
+  return {
+    input: a.input + b.input,
+    output: a.output + b.output,
+    reasoning: a.reasoning + b.reasoning,
+    cache: { read: a.cache.read + b.cache.read, write: a.cache.write + b.cache.write },
+    ...(hasTotal ? { total: totalA + totalB } : {}),
+  };
+}
+
 function updateProviderSession(
   context: OpenCodeSessionContext,
   patch: Partial<ProviderSession>,
@@ -1005,11 +1020,15 @@ export function makeOpenCodeAdapter(
       }
       const snapshot = openCodeTokensToSnapshot(tokens);
       if (snapshot.usedTokens <= 0) return;
-      // Remember for turn.completed only after validating non-zero tokens.
-      // This prevents zero-token events from overwriting previous valid usage
-      // and ensures cost/model are not leaked on empty turns.
-      context.lastTokens = tokens;
-      rememberOpenCodeCostAndModel(context, cost, model, providerId);
+      // Accumulate for turn.completed — tool-calling turns emit multiple
+      // assistant records, so we sum tokens/cost and group by model for
+      // modelUsage instead of overwriting the last value.
+      if (context.lastTokens === null) {
+        context.lastTokens = tokens;
+      } else {
+        context.lastTokens = mergeOpenCodeTokens(context.lastTokens, tokens);
+      }
+      rememberOpenCodeCostAndModel(context, cost, model, providerId, tokens);
       yield* emit({
         ...(yield* buildEventBase({
           threadId: context.session.threadId,
@@ -1028,14 +1047,18 @@ export function makeOpenCodeAdapter(
       cost: unknown,
       model: unknown,
       providerId: unknown,
+      tokens?: OpenCodeTokens,
     ) => {
-      if (typeof cost === "number" && Number.isFinite(cost)) context.lastCost = cost;
+      if (typeof cost === "number" && Number.isFinite(cost)) {
+        context.lastCost = (context.lastCost ?? 0) + cost;
+      }
+      let modelKey: string | null = null;
       if (typeof model === "string" && model.trim().length > 0) {
         const provider =
           typeof providerId === "string" && providerId.trim().length > 0
             ? providerId.trim()
             : "opencode";
-        context.lastModel = `${provider}/${model.trim()}`;
+        modelKey = `${provider}/${model.trim()}`;
       } else if (typeof model === "object" && model !== null) {
         const record = model as Record<string, unknown>;
         const id =
@@ -1050,7 +1073,18 @@ export function makeOpenCodeAdapter(
             : typeof record.provider === "string"
               ? record.provider
               : "opencode";
-        if (id) context.lastModel = `${prov}/${id}`;
+        if (id) modelKey = `${prov}/${id}`;
+      }
+      if (modelKey) {
+        context.lastModel = modelKey;
+        if (tokens) {
+          const existing = context.modelUsage.get(modelKey);
+          if (existing) {
+            context.modelUsage.set(modelKey, mergeOpenCodeTokens(existing, tokens));
+          } else {
+            context.modelUsage.set(modelKey, tokens);
+          }
+        }
       }
     };
 
@@ -1105,9 +1139,17 @@ export function makeOpenCodeAdapter(
       const usage = context.lastTokens;
       const cost = context.lastCost;
       const model = context.lastModel;
+      const modelUsageEntries = [...context.modelUsage.entries()];
       context.lastTokens = null;
       context.lastCost = null;
       context.lastModel = null;
+      context.modelUsage.clear();
+      const modelUsage =
+        modelUsageEntries.length > 0
+          ? Object.fromEntries(modelUsageEntries)
+          : model && usage
+            ? { [model]: usage }
+            : undefined;
       yield* emit({
         ...(yield* buildEventBase({
           threadId: context.session.threadId,
@@ -1120,7 +1162,7 @@ export function makeOpenCodeAdapter(
           ...(usage
             ? {
                 usage,
-                ...(model ? { modelUsage: { [model]: usage } } : {}),
+                ...(modelUsage ? { modelUsage } : {}),
               }
             : {}),
           ...(cost !== null ? { totalCostUsd: cost } : {}),
@@ -1271,6 +1313,7 @@ export function makeOpenCodeAdapter(
       context.lastTokens = null;
       context.lastCost = null;
       context.lastModel = null;
+      context.modelUsage.clear();
       yield* updateProviderSession(
         context,
         { status: "error", lastError: detail },
@@ -1467,6 +1510,7 @@ export function makeOpenCodeAdapter(
       context.lastTokens = null;
       context.lastCost = null;
       context.lastModel = null;
+      context.modelUsage.clear();
       if (context.activeTurnId === turnId) {
         context.activeTurnId = undefined;
         context.activeAgent = undefined;
@@ -2353,6 +2397,7 @@ export function makeOpenCodeAdapter(
           context.lastTokens = null;
           context.lastCost = null;
           context.lastModel = null;
+          context.modelUsage.clear();
           yield* updateProviderSession(
             context,
             {
@@ -2707,6 +2752,7 @@ export function makeOpenCodeAdapter(
           lastTokens: null,
           lastCost: null,
           lastModel: null,
+          modelUsage: new Map(),
           cancellation: undefined,
           interruptedTurnId: undefined,
           reconcileIdleStatus: false,
