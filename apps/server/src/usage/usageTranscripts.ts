@@ -70,6 +70,7 @@ export function totalTokens(totals: UsageTokenTotals): number {
 export function mightCarryUsage(line: string, provider: UsageProviderKind): boolean {
   if (provider === "claude") return line.includes('"usage"');
   if (provider === "grok") return line.includes('"turn_completed"');
+  if (provider === "opencode") return line.includes('"tokens"');
   return line.includes('"token_count"');
 }
 
@@ -483,6 +484,81 @@ export function parseGrokLine(line: string): readonly UsageRecord[] {
     });
   }
   return results;
+}
+
+/* -------------------------------------------------------------------------- */
+/* OpenCode                                                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Parses one message record from the OpenCode SQLite `message` table.
+ *
+ * Expects the JSON stored in `message.data` and the `message.id` /
+ * `message.session_id` columns. Only assistant messages with token counts are
+ * emitted; user messages and assistants without usage are ignored.
+ */
+export function parseOpenCodeMessage(
+  data: string,
+  messageId: string,
+  sessionId: string,
+): UsageRecord | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(data);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const record = parsed as Record<string, unknown>;
+  if (record.role !== "assistant") return null;
+
+  const tokensRaw = record.tokens;
+  if (typeof tokensRaw !== "object" || tokensRaw === null) return null;
+  const tokens = tokensRaw as Record<string, unknown>;
+  const cacheRaw = tokens.cache as Record<string, unknown> | undefined;
+
+  const inputTokens = int(tokens.input);
+  const outputTokens = int(tokens.output);
+  const reasoningTokens = int(tokens.reasoning);
+  const cachedRead = int(cacheRaw?.read);
+  const cacheWrite = int(cacheRaw?.write);
+
+  const totals: UsageTokenTotals = {
+    uncachedInputTokens: Math.max(0, inputTokens - cachedRead - cacheWrite),
+    cachedInputTokens: cachedRead,
+    cacheCreationTokens: cacheWrite,
+    outputTokens,
+    reasoningTokens: Math.min(outputTokens, reasoningTokens),
+  };
+
+  if (totalTokens(totals) === 0) return null;
+
+  // Prefer completed timestamp for bucketing, fall back to created.
+  let timestampMs: number | null = null;
+  const timeRaw = record.time as Record<string, unknown> | undefined;
+  if (timeRaw) {
+    if (typeof timeRaw.completed === "number" && Number.isFinite(timeRaw.completed)) {
+      timestampMs = timeRaw.completed;
+    } else if (typeof timeRaw.created === "number" && Number.isFinite(timeRaw.created)) {
+      timestampMs = timeRaw.created;
+    }
+  }
+  if (timestampMs === null) return null;
+
+  const modelId = typeof record.modelID === "string" ? record.modelID : "";
+  const providerId = typeof record.providerID === "string" ? record.providerID : "opencode";
+  const model = modelId.length > 0 ? `${providerId}/${modelId}` : providerId;
+
+  const cost = record.cost;
+  return {
+    provider: "opencode",
+    timestampMs,
+    model,
+    sessionId,
+    totals,
+    reportedCostUsd: typeof cost === "number" && Number.isFinite(cost) ? cost : null,
+    dedupeKey: messageId.length > 0 ? messageId : null,
+  };
 }
 
 export { EMPTY_TOTALS };

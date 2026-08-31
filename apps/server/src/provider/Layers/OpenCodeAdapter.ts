@@ -237,6 +237,9 @@ interface OpenCodeSessionContext {
   activeTurnId: TurnId | undefined;
   activeAgent: string | undefined;
   activeVariant: string | undefined;
+  lastTokens: OpenCodeTokens | null;
+  lastCost: number | null;
+  lastModel: string | null;
   /**
    * One-shot guard flipped by `stopOpenCodeContext` / `emitUnexpectedExit`.
    * The session lifecycle is owned by `sessionScope`; this Ref exists only
@@ -528,6 +531,65 @@ function sessionErrorMessage(error: unknown): string {
     : "OpenCode session failed.";
 }
 
+interface OpenCodeTokens {
+  readonly input: number;
+  readonly output: number;
+  readonly reasoning: number;
+  readonly cache: { readonly read: number; readonly write: number };
+  readonly total?: number;
+}
+
+function readOpenCodeTokens(value: unknown): OpenCodeTokens | null {
+  if (typeof value !== "object" || value === null) return null;
+  const record = value as Record<string, unknown>;
+  const input = typeof record.input === "number" ? record.input : null;
+  const output = typeof record.output === "number" ? record.output : null;
+  if (input === null || output === null) return null;
+  const reasoning = typeof record.reasoning === "number" ? record.reasoning : 0;
+  const cacheRaw = record.cache;
+  let cacheRead = 0;
+  let cacheWrite = 0;
+  if (typeof cacheRaw === "object" && cacheRaw !== null) {
+    const cache = cacheRaw as Record<string, unknown>;
+    cacheRead = typeof cache.read === "number" ? cache.read : 0;
+    cacheWrite = typeof cache.write === "number" ? cache.write : 0;
+  }
+  const total = typeof record.total === "number" ? record.total : undefined;
+  return {
+    input,
+    output,
+    reasoning,
+    cache: { read: cacheRead, write: cacheWrite },
+    ...(total !== undefined ? { total } : {}),
+  };
+}
+
+function openCodeTokensToSnapshot(tokens: OpenCodeTokens): {
+  readonly usedTokens: number;
+  readonly inputTokens: number;
+  readonly cachedInputTokens: number;
+  readonly outputTokens: number;
+  readonly reasoningOutputTokens: number;
+} {
+  const usedTokens = tokens.total ?? tokens.input + tokens.output;
+  const cachedInputTokens = tokens.cache.read;
+  const inputTokens = Math.max(0, tokens.input - cachedInputTokens - tokens.cache.write);
+  return {
+    usedTokens: Math.max(0, usedTokens),
+    inputTokens,
+    cachedInputTokens,
+    outputTokens: tokens.output,
+    reasoningOutputTokens: Math.min(tokens.output, tokens.reasoning),
+  };
+}
+
+function tryExtractOpenCodeTokensFromRecord(
+  record: Record<string, unknown>,
+): OpenCodeTokens | null {
+  if ("tokens" in record) return readOpenCodeTokens(record.tokens);
+  return null;
+}
+
 function updateProviderSession(
   context: OpenCodeSessionContext,
   patch: Partial<ProviderSession>,
@@ -682,6 +744,66 @@ export function makeOpenCodeAdapter(
         readonly event: Record<string, unknown>;
       },
     ) => writeNativeEvent(threadId, event).pipe(Effect.catchCause(() => Effect.void));
+
+    const emitOpenCodeTokenUsage = Effect.fn("emitOpenCodeTokenUsage")(function* (
+      context: OpenCodeSessionContext,
+      tokens: OpenCodeTokens,
+      turnId: TurnId | undefined,
+      raw: unknown,
+    ) {
+      // Remember for turn.completed
+      context.lastTokens = tokens;
+      if (
+        tokens.input + tokens.output + tokens.cache.read + tokens.cache.write === 0 &&
+        tokens.total === undefined
+      ) {
+        return;
+      }
+      const snapshot = openCodeTokensToSnapshot(tokens);
+      if (snapshot.usedTokens <= 0) return;
+      yield* emit({
+        ...(yield* buildEventBase({
+          threadId: context.session.threadId,
+          turnId,
+          raw,
+        })),
+        type: "thread.token-usage.updated",
+        payload: {
+          usage: snapshot,
+        },
+      });
+    });
+
+    const rememberOpenCodeCostAndModel = (
+      context: OpenCodeSessionContext,
+      cost: unknown,
+      model: unknown,
+      providerId: unknown,
+    ) => {
+      if (typeof cost === "number" && Number.isFinite(cost)) context.lastCost = cost;
+      if (typeof model === "string" && model.trim().length > 0) {
+        const provider =
+          typeof providerId === "string" && providerId.trim().length > 0
+            ? providerId.trim()
+            : "opencode";
+        context.lastModel = `${provider}/${model.trim()}`;
+      } else if (typeof model === "object" && model !== null) {
+        const record = model as Record<string, unknown>;
+        const id =
+          typeof record.id === "string"
+            ? record.id
+            : typeof record.modelID === "string"
+              ? record.modelID
+              : null;
+        const prov =
+          typeof record.providerID === "string"
+            ? record.providerID
+            : typeof record.provider === "string"
+              ? record.provider
+              : "opencode";
+        if (id) context.lastModel = `${prov}/${id}`;
+      }
+    };
 
     const emitUnexpectedExit = Effect.fn("emitUnexpectedExit")(function* (
       context: OpenCodeSessionContext,
@@ -839,6 +961,26 @@ export function makeOpenCodeAdapter(
               },
             });
           }
+          // Session carries cumulative tokens/cost - emit live usage
+          {
+            const info = (event.properties as Record<string, unknown>).info as
+              | Record<string, unknown>
+              | undefined;
+            if (info) {
+              const tokens = readOpenCodeTokens(info.tokens);
+              if (tokens) {
+                rememberOpenCodeCostAndModel(
+                  context,
+                  info.cost,
+                  info.model ?? info.modelID,
+                  (info as Record<string, unknown>).providerID,
+                );
+                if (info.cost !== undefined)
+                  context.lastCost = typeof info.cost === "number" ? info.cost : context.lastCost;
+                yield* emitOpenCodeTokenUsage(context, tokens, turnId, event);
+              }
+            }
+          }
           break;
         }
 
@@ -850,6 +992,17 @@ export function makeOpenCodeAdapter(
                 continue;
               }
               yield* emitAssistantTextDelta(context, part, turnId, event);
+            }
+            const info = event.properties.info as unknown as Record<string, unknown>;
+            const tokens = readOpenCodeTokens(info.tokens);
+            if (tokens) {
+              rememberOpenCodeCostAndModel(
+                context,
+                info.cost,
+                info.modelID ?? info.model,
+                info.providerID,
+              );
+              yield* emitOpenCodeTokenUsage(context, tokens, turnId, event);
             }
           }
           break;
@@ -912,6 +1065,21 @@ export function makeOpenCodeAdapter(
 
           if (messageRole === "assistant") {
             yield* emitAssistantTextDelta(context, part, turnId, event);
+          }
+
+          // Step-finish and other token-carrying parts
+          {
+            const partRecord = part as unknown as Record<string, unknown>;
+            const tokens = readOpenCodeTokens(partRecord.tokens);
+            if (tokens) {
+              rememberOpenCodeCostAndModel(
+                context,
+                partRecord.cost,
+                (partRecord.modelID as string | undefined) ?? (partRecord.model as unknown),
+                partRecord.providerID as string | undefined,
+              );
+              yield* emitOpenCodeTokenUsage(context, tokens, turnId, event);
+            }
           }
 
           if (part.type === "tool") {
@@ -1076,6 +1244,17 @@ export function makeOpenCodeAdapter(
           if (event.properties.status.type === "idle" && turnId) {
             context.activeTurnId = undefined;
             yield* updateProviderSession(context, { status: "ready" }, { clearActiveTurnId: true });
+            const completedPayload: Record<string, unknown> = { state: "completed" };
+            if (context.lastTokens) {
+              completedPayload.usage = context.lastTokens;
+              completedPayload.modelUsage = context.lastModel
+                ? { [context.lastModel]: context.lastTokens }
+                : undefined;
+            }
+            if (context.lastCost !== null) completedPayload.totalCostUsd = context.lastCost;
+            // Reset for next turn - keep model but clear tokens to avoid leaking to next turn's idle if no tokens
+            context.lastTokens = null;
+            context.lastCost = null;
             yield* emit({
               ...(yield* buildEventBase({
                 threadId: context.session.threadId,
@@ -1083,9 +1262,7 @@ export function makeOpenCodeAdapter(
                 raw: event,
               })),
               type: "turn.completed",
-              payload: {
-                state: "completed",
-              },
+              payload: completedPayload as never,
             });
           }
           break;
@@ -1132,8 +1309,53 @@ export function makeOpenCodeAdapter(
           break;
         }
 
-        default:
+        default: {
+          // Generic token extraction for events like `session.next.step.ended`, `session.diff`, etc.
+          // These carry `tokens`/`cost`/`model` at top-level properties or nested.
+          const props = (event as Record<string, unknown>).properties as
+            | Record<string, unknown>
+            | undefined;
+          if (props) {
+            const tokens =
+              readOpenCodeTokens(props.tokens) ??
+              readOpenCodeTokens((props.part as Record<string, unknown> | undefined)?.tokens) ??
+              readOpenCodeTokens((props.info as Record<string, unknown> | undefined)?.tokens) ??
+              null;
+            if (tokens) {
+              const cost =
+                (props.cost as number | undefined) ??
+                (props.info as Record<string, unknown> | undefined)?.cost ??
+                (props.part as Record<string, unknown> | undefined)?.cost;
+              const model =
+                (props.model as unknown) ??
+                (props.info as Record<string, unknown> | undefined)?.model ??
+                (props.info as Record<string, unknown> | undefined)?.modelID ??
+                (props.part as Record<string, unknown> | undefined)?.modelID;
+              const providerId =
+                (props.providerID as string | undefined) ??
+                (props.info as Record<string, unknown> | undefined)?.providerID ??
+                (props.part as Record<string, unknown> | undefined)?.providerID;
+              rememberOpenCodeCostAndModel(context, cost, model, providerId);
+              yield* emitOpenCodeTokenUsage(context, tokens, turnId, event);
+            } else {
+              // Also try nested usage like `event.properties.tokens` already covered, try `event.properties.data.tokens`
+              const data = props.data as Record<string, unknown> | undefined;
+              if (data) {
+                const nestedTokens = readOpenCodeTokens(data.tokens);
+                if (nestedTokens) {
+                  rememberOpenCodeCostAndModel(
+                    context,
+                    data.cost,
+                    data.modelID ?? data.model,
+                    data.providerID,
+                  );
+                  yield* emitOpenCodeTokenUsage(context, nestedTokens, turnId, event);
+                }
+              }
+            }
+          }
           break;
+        }
       }
     });
 
@@ -1402,6 +1624,9 @@ export function makeOpenCodeAdapter(
           activeTurnId: undefined,
           activeAgent: undefined,
           activeVariant: undefined,
+          lastTokens: null,
+          lastCost: null,
+          lastModel: null,
           stopped: yield* Ref.make(false),
           sessionScope: started.sessionScope,
         };
