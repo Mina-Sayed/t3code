@@ -157,7 +157,6 @@ export async function readOpenCodeDbRecords(
           if (record !== null) records.push(record);
           // Yield to event loop every 100 rows to avoid blocking cold scans.
           if (++count % 100 === 0) {
-            // eslint-disable-next-line no-await-in-loop
             await new Promise<void>((resolve) => setImmediate(resolve));
           }
         }
