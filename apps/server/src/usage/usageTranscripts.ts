@@ -524,7 +524,8 @@ export function parseOpenCodeMessage(
   const cacheWrite = int(cacheRaw?.write);
 
   const totals: UsageTokenTotals = {
-    uncachedInputTokens: Math.max(0, inputTokens - cachedRead - cacheWrite),
+    // OpenCode reports `input` exclusive of cache (unlike Codex/Grok which are inclusive).
+    uncachedInputTokens: inputTokens,
     cachedInputTokens: cachedRead,
     cacheCreationTokens: cacheWrite,
     outputTokens,

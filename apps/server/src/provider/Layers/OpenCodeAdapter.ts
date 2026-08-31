@@ -571,9 +571,11 @@ function openCodeTokensToSnapshot(tokens: OpenCodeTokens): {
   readonly outputTokens: number;
   readonly reasoningOutputTokens: number;
 } {
-  const usedTokens = tokens.total ?? tokens.input + tokens.output;
+  // OpenCode reports `input` exclusive of cache (unlike Codex/Grok). Don't subtract.
   const cachedInputTokens = tokens.cache.read;
-  const inputTokens = Math.max(0, tokens.input - cachedInputTokens - tokens.cache.write);
+  const inputTokens = tokens.input;
+  const usedTokens =
+    tokens.total ?? tokens.input + tokens.output + tokens.cache.read + tokens.cache.write;
   return {
     usedTokens: Math.max(0, usedTokens),
     inputTokens,
@@ -961,26 +963,11 @@ export function makeOpenCodeAdapter(
               },
             });
           }
-          // Session carries cumulative tokens/cost - emit live usage
-          {
-            const info = (event.properties as Record<string, unknown>).info as
-              | Record<string, unknown>
-              | undefined;
-            if (info) {
-              const tokens = readOpenCodeTokens(info.tokens);
-              if (tokens) {
-                rememberOpenCodeCostAndModel(
-                  context,
-                  info.cost,
-                  info.model ?? info.modelID,
-                  (info as Record<string, unknown>).providerID,
-                );
-                if (info.cost !== undefined)
-                  context.lastCost = typeof info.cost === "number" ? info.cost : context.lastCost;
-                yield* emitOpenCodeTokenUsage(context, tokens, turnId, event);
-              }
-            }
-          }
+          // Note: `info.tokens`/`cost` on session.updated are cumulative for the whole
+          // session, not per-turn. Emitting them as `thread.token-usage.updated` would
+          // make the context bar track lifetime usage and cause turn.completed to report
+          // the entire session as one turn, so they are intentionally ignored here.
+          // Per-turn usage comes from message.updated / step-finish parts.
           break;
         }
 
@@ -1244,17 +1231,12 @@ export function makeOpenCodeAdapter(
           if (event.properties.status.type === "idle" && turnId) {
             context.activeTurnId = undefined;
             yield* updateProviderSession(context, { status: "ready" }, { clearActiveTurnId: true });
-            const completedPayload: Record<string, unknown> = { state: "completed" };
-            if (context.lastTokens) {
-              completedPayload.usage = context.lastTokens;
-              completedPayload.modelUsage = context.lastModel
-                ? { [context.lastModel]: context.lastTokens }
-                : undefined;
-            }
-            if (context.lastCost !== null) completedPayload.totalCostUsd = context.lastCost;
-            // Reset for next turn - keep model but clear tokens to avoid leaking to next turn's idle if no tokens
+            const usage = context.lastTokens;
+            const cost = context.lastCost;
+            const model = context.lastModel;
             context.lastTokens = null;
             context.lastCost = null;
+            context.lastModel = null;
             yield* emit({
               ...(yield* buildEventBase({
                 threadId: context.session.threadId,
@@ -1262,7 +1244,16 @@ export function makeOpenCodeAdapter(
                 raw: event,
               })),
               type: "turn.completed",
-              payload: completedPayload as never,
+              payload: {
+                state: "completed",
+                ...(usage
+                  ? {
+                      usage,
+                      ...(model ? { modelUsage: { [model]: usage } } : {}),
+                    }
+                  : {}),
+                ...(cost !== null ? { totalCostUsd: cost } : {}),
+              },
             });
           }
           break;

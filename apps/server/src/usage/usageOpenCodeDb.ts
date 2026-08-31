@@ -28,15 +28,17 @@ import { parseOpenCodeMessage } from "./usageTranscripts.ts";
  *
  * Returns the first path that exists, or `null` if none exist.
  */
-export async function resolveOpenCodeDbPath(): Promise<string | null> {
+export async function resolveOpenCodeDbPath(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string | null> {
   const candidates: string[] = [];
 
-  const dataDirEnv = process.env.OPENCODE_DATA_DIR?.trim();
+  const dataDirEnv = env.OPENCODE_DATA_DIR?.trim();
   if (dataDirEnv && dataDirEnv.length > 0) {
     candidates.push(NodePath.join(dataDirEnv, "opencode.db"));
   }
 
-  const xdgDataHome = process.env.XDG_DATA_HOME?.trim();
+  const xdgDataHome = env.XDG_DATA_HOME?.trim();
   if (xdgDataHome && xdgDataHome.length > 0) {
     candidates.push(NodePath.join(xdgDataHome, "opencode", "opencode.db"));
   }
@@ -67,6 +69,9 @@ export async function resolveOpenCodeDbPath(): Promise<string | null> {
  * writing with WAL. Returns `null` if the file cannot be opened or the
  * schema is unexpected; an empty array if the file exists but has no
  * relevant rows. Caller is responsible for caching by `(size, mtime)`.
+ *
+ * Reads both the legacy `message` table and the current `session_message`
+ * table (OpenCode v2), unioning the results.
  */
 export async function readOpenCodeDbRecords(
   dbPath: string,
@@ -87,18 +92,33 @@ export async function readOpenCodeDbRecords(
   }
 
   try {
-    // Verify table exists
-    const tableCheck = db
-      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='message'")
-      .get() as { name: string } | undefined;
-    if (!tableCheck) return [];
-
-    const stmt = db.prepare("SELECT id, session_id, data FROM message");
-    const rows = stmt.all() as Array<{ id: string; session_id: string; data: string }>;
     const records: UsageRecord[] = [];
-    for (const row of rows) {
-      const record = parseOpenCodeMessage(row.data, row.id, row.session_id);
-      if (record !== null) records.push(record);
+    const tables: string[] = [];
+    try {
+      const rows = db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('message','session_message')",
+        )
+        .all() as Array<{ name: string }>;
+      for (const row of rows) tables.push(row.name);
+    } catch {
+      return null;
+    }
+    if (tables.length === 0) return [];
+
+    for (const table of tables) {
+      try {
+        // `message` has `session_id`, `session_message` has `session_id` as well but different time columns; data is same shape.
+        const stmt = db.prepare(`SELECT id, session_id, data FROM "${table}"`);
+        const rows = stmt.all() as Array<{ id: string; session_id: string; data: string }>;
+        for (const row of rows) {
+          const record = parseOpenCodeMessage(row.data, row.id, row.session_id);
+          if (record !== null) records.push(record);
+        }
+      } catch {
+        // One table failing shouldn't hide the other; treat as empty for that table.
+        continue;
+      }
     }
     return records;
   } catch {
@@ -111,14 +131,30 @@ export async function readOpenCodeDbRecords(
 }
 
 /**
- * Gets file stats for caching (size, mtime) for the OpenCode DB.
+ * Gets file stats for caching (size, mtime) for the OpenCode DB, including WAL.
+ *
+ * When OpenCode runs in WAL mode, committed messages live in `opencode.db-wal`
+ * while the main file's mtime/size can stay stale until a checkpoint. Including
+ * the WAL's fingerprint ensures a refresh sees new rows immediately.
  */
 export async function statOpenCodeDb(
   dbPath: string,
 ): Promise<{ size: number; mtimeMs: number } | null> {
   try {
     const stats = await NodeFS.promises.stat(dbPath);
-    return { size: stats.size, mtimeMs: stats.mtimeMs };
+    let size = stats.size;
+    let mtimeMs = stats.mtimeMs;
+    // Include WAL file if present - its mtime/size changes on every committed write.
+    const walPath = `${dbPath}-wal`;
+    try {
+      const walStats = await NodeFS.promises.stat(walPath);
+      size += walStats.size;
+      mtimeMs = Math.max(mtimeMs, walStats.mtimeMs);
+    } catch {
+      // No WAL file, that's fine.
+    }
+    // Also include shm for completeness, though its mtime is less meaningful.
+    return { size, mtimeMs };
   } catch {
     return null;
   }

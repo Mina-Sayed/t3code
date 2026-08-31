@@ -1,4 +1,3 @@
-// @effect-diagnostics nodeBuiltinImport:off
 /**
  * UsageService - scans provider transcripts and returns priced usage buckets.
  *
@@ -13,7 +12,6 @@
  * @module UsageService
  */
 import * as NodeOS from "node:os";
-import * as NodePath from "node:path";
 
 import {
   USAGE_CONTRACT_VERSION,
@@ -318,7 +316,7 @@ export const make = Effect.gen(function* () {
     dbPath: string,
     size: number,
     mtimeMs: number,
-  ): Effect.Effect<readonly UsageRecord[]> =>
+  ): Effect.Effect<readonly UsageRecord[] | null> =>
     Effect.gen(function* () {
       const cached = fileCache.get(dbPath);
       if (
@@ -330,7 +328,7 @@ export const make = Effect.gen(function* () {
         return cached.records;
       }
       const parsed = yield* Effect.promise(() => readOpenCodeDbRecords(dbPath));
-      if (parsed === null) return [];
+      if (parsed === null) return null;
       const records = dedupeWithinFile(parsed);
       fileCache.set(dbPath, { size, mtimeMs, provider: "opencode" as const, records });
       cacheDirty = true;
@@ -459,9 +457,9 @@ export const make = Effect.gen(function* () {
 
     // OpenCode: SQLite DB instead of transcript files
     {
-      const dbPath = yield* Effect.promise(() => resolveOpenCodeDbPath());
+      const dbPath = yield* Effect.promise(() => resolveOpenCodeDbPath(hostEnvironment));
       if (dbPath === null) {
-        const fallbackPath = NodePath.join(
+        const fallbackPath = path.join(
           NodeOS.homedir(),
           ".local",
           "share",
@@ -502,36 +500,53 @@ export const make = Effect.gen(function* () {
             message: "OpenCode database could not be read.",
           });
         } else {
-          walkedRoots.push(NodePath.dirname(dbPath));
+          walkedRoots.push(path.dirname(dbPath));
           livePaths.add(dbPath);
           const records = yield* readOpenCodeDbRecordsCached(dbPath, stat.size, stat.mtimeMs);
-          const sessionIds = new Set<string>();
-          let scannedFiles = 0;
-          let skippedFiles = 0;
-          if (records.length === 0) {
-            skippedFiles = 1;
+          if (records === null) {
+            sources.push({
+              fingerprint: {
+                hostId,
+                provider: "opencode" as const,
+                resolvedHomePath: dbPath,
+                volumeId,
+              },
+              status: "failed",
+              scannedFiles: 0,
+              skippedFiles: 0,
+              malformedRecords: 0,
+              distinctSessions: 0,
+              message: "OpenCode database could not be read.",
+            });
           } else {
-            scannedFiles = 1;
-          }
-          for (const record of records) {
-            if (aggregator.add(record) && record.sessionId.length > 0) {
-              sessionIds.add(record.sessionId);
+            const sessionIds = new Set<string>();
+            let scannedFiles = 0;
+            let skippedFiles = 0;
+            if (records.length === 0) {
+              skippedFiles = 1;
+            } else {
+              scannedFiles = 1;
             }
+            for (const record of records) {
+              if (aggregator.add(record) && record.sessionId.length > 0) {
+                sessionIds.add(record.sessionId);
+              }
+            }
+            sources.push({
+              fingerprint: {
+                hostId,
+                provider: "opencode" as const,
+                resolvedHomePath: dbPath,
+                volumeId,
+              },
+              status: "ok",
+              scannedFiles,
+              skippedFiles,
+              malformedRecords: 0,
+              distinctSessions: sessionIds.size,
+              message: null,
+            });
           }
-          sources.push({
-            fingerprint: {
-              hostId,
-              provider: "opencode" as const,
-              resolvedHomePath: dbPath,
-              volumeId,
-            },
-            status: "ok",
-            scannedFiles,
-            skippedFiles,
-            malformedRecords: 0,
-            distinctSessions: sessionIds.size,
-            message: null,
-          });
         }
       }
     }
