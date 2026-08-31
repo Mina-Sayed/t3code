@@ -495,6 +495,7 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
   // that only the persisted list is populated, hence max not sum.
   const attachmentCount =
     Math.max(composer.images.length, composer.persistedAttachments.length) +
+    composer.files.length +
     composer.terminalContexts.length +
     composer.elementContexts.length +
     composer.previewAnnotations.length +
@@ -1752,7 +1753,7 @@ export default function Sidebar() {
     snoozeThread,
     unsnoozeThread,
     pinThread,
-    unpinThread,
+    confirmAndUnpinThread,
     reorderPinnedThread,
     archiveThread,
     deleteThread,
@@ -2712,7 +2713,7 @@ export default function Sidebar() {
   const attemptUnpin = useCallback(
     (threadRef: ScopedThreadRef) => {
       void (async () => {
-        const result = await unpinThread(threadRef);
+        const result = await confirmAndUnpinThread(threadRef);
         if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
           const error = squashAtomCommandFailure(result);
           toastManager.add(
@@ -2725,7 +2726,7 @@ export default function Sidebar() {
         }
       })();
     },
-    [unpinThread],
+    [confirmAndUnpinThread],
   );
 
   const handlePinnedDragEnd = useCallback(
@@ -3585,7 +3586,10 @@ export default function Sidebar() {
                     </span>
                     <ChevronDownIcon className="-mr-px size-4 shrink-0" />
                   </ComboboxTrigger>
-                  <ComboboxPopup align="start" className="w-(--anchor-width)">
+                  <ComboboxPopup
+                    align="start"
+                    className="w-(--anchor-width) min-w-0 overflow-hidden"
+                  >
                     <div className="shrink-0 px-3 pt-2.5">
                       <div className="relative -translate-y-px border-b border-border/70 pb-1.5 transition-colors focus-within:border-ring">
                         <SearchIcon
