@@ -1,4 +1,4 @@
-// @effect-diagnostics nodeBuiltinImport:off
+// @effect-diagnostics nodeBuiltinImport:off - `node:sqlite` has no Effect wrapper, so this reader stays on Node built-ins; isolated here so the rest of the usage code keeps using Effect's FileSystem/Path.
 /**
  * SQLite reader for OpenCode's `opencode.db`.
  *
@@ -108,12 +108,51 @@ export async function readOpenCodeDbRecords(
 
     for (const table of tables) {
       try {
-        // `message` has `session_id`, `session_message` has `session_id` as well but different time columns; data is same shape.
-        const stmt = db.prepare(`SELECT id, session_id, data FROM "${table}"`);
-        const rows = stmt.all() as Array<{ id: string; session_id: string; data: string }>;
-        for (const row of rows) {
-          const record = parseOpenCodeMessage(row.data, row.id, row.session_id);
+        // Use iterate() instead of all() to avoid loading all rows at once and to allow yielding.
+        let rows: Iterable<Record<string, unknown>>;
+        let isSessionMessage = table === "session_message";
+        try {
+          if (isSessionMessage) {
+            const stmt = db.prepare(
+              `SELECT id, session_id, type, time_created, time_updated, data FROM "${table}"`,
+            );
+            rows = stmt.iterate() as Iterable<Record<string, unknown>>;
+          } else {
+            const stmt = db.prepare(
+              `SELECT id, session_id, time_created, time_updated, data FROM "${table}"`,
+            );
+            rows = stmt.iterate() as Iterable<Record<string, unknown>>;
+          }
+        } catch {
+          // Fallback for older schemas without time columns
+          const stmt = db.prepare(`SELECT id, session_id, data FROM "${table}"`);
+          rows = stmt.iterate() as Iterable<Record<string, unknown>>;
+          isSessionMessage = false;
+        }
+        let count = 0;
+        for (const raw of rows) {
+          const row = raw as {
+            id: string;
+            session_id: string;
+            data: string;
+            type?: string;
+            time_created?: number;
+            time_updated?: number;
+          };
+          const record = parseOpenCodeMessage(
+            row.data,
+            row.id,
+            row.session_id,
+            isSessionMessage ? row.type : undefined,
+            row.time_created,
+            row.time_updated,
+          );
           if (record !== null) records.push(record);
+          // Yield to event loop every 100 rows to avoid blocking cold scans.
+          if (++count % 100 === 0) {
+            // eslint-disable-next-line no-await-in-loop
+            await new Promise<void>((resolve) => setImmediate(resolve));
+          }
         }
       } catch {
         // One table failing shouldn't hide the other; treat as empty for that table.

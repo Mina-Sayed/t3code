@@ -501,6 +501,9 @@ export function parseOpenCodeMessage(
   data: string,
   messageId: string,
   sessionId: string,
+  columnType?: string,
+  columnTimeCreated?: number,
+  columnTimeUpdated?: number,
 ): UsageRecord | null {
   let parsed: unknown;
   try {
@@ -510,7 +513,9 @@ export function parseOpenCodeMessage(
   }
   if (typeof parsed !== "object" || parsed === null) return null;
   const record = parsed as Record<string, unknown>;
-  if (record.role !== "assistant") return null;
+  // V2 stores role in the `type` column; V1 stores it in `data.role`.
+  const role = typeof columnType === "string" ? columnType : (record.role as string | undefined);
+  if (role !== "assistant") return null;
 
   const tokensRaw = record.tokens;
   if (typeof tokensRaw !== "object" || tokensRaw === null) return null;
@@ -534,7 +539,7 @@ export function parseOpenCodeMessage(
 
   if (totalTokens(totals) === 0) return null;
 
-  // Prefer completed timestamp for bucketing, fall back to created.
+  // Prefer completed timestamp for bucketing, fall back to created, then column times (V2).
   let timestampMs: number | null = null;
   const timeRaw = record.time as Record<string, unknown> | undefined;
   if (timeRaw) {
@@ -544,10 +549,25 @@ export function parseOpenCodeMessage(
       timestampMs = timeRaw.created;
     }
   }
+  if (timestampMs === null) {
+    if (typeof columnTimeUpdated === "number" && Number.isFinite(columnTimeUpdated)) {
+      timestampMs = columnTimeUpdated;
+    } else if (typeof columnTimeCreated === "number" && Number.isFinite(columnTimeCreated)) {
+      timestampMs = columnTimeCreated;
+    }
+  }
   if (timestampMs === null) return null;
 
-  const modelId = typeof record.modelID === "string" ? record.modelID : "";
-  const providerId = typeof record.providerID === "string" ? record.providerID : "opencode";
+  let modelId = typeof record.modelID === "string" ? record.modelID : "";
+  let providerId = typeof record.providerID === "string" ? record.providerID : "opencode";
+  // V2 nests model under `model.id` / `model.providerID`.
+  if (modelId.length === 0 && typeof record.model === "object" && record.model !== null) {
+    const modelObj = record.model as Record<string, unknown>;
+    if (typeof modelObj.id === "string") modelId = modelObj.id;
+    else if (typeof modelObj.modelID === "string") modelId = modelObj.modelID;
+    if (typeof modelObj.providerID === "string") providerId = modelObj.providerID;
+    else if (typeof modelObj.provider === "string") providerId = modelObj.provider;
+  }
   const model = modelId.length > 0 ? `${providerId}/${modelId}` : providerId;
 
   const cost = record.cost;
