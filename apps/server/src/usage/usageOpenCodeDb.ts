@@ -129,9 +129,12 @@ export async function readOpenCodeDbRecords(
           }
         } catch {
           // Fallback for older schemas without time columns
-          stmt = db.prepare(`SELECT id, session_id, data FROM "${table}"`);
+          stmt = db.prepare(
+            isSessionMessage
+              ? `SELECT id, session_id, type, data FROM "${table}"`
+              : `SELECT id, session_id, data FROM "${table}"`,
+          );
           rows = stmt.iterate() as Iterable<Record<string, unknown>>;
-          isSessionMessage = false;
         }
         let count = 0;
         for (const raw of rows) {

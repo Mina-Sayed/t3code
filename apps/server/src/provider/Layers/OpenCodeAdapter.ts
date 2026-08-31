@@ -3010,6 +3010,10 @@ export function makeOpenCodeAdapter(
                       context.activeTurnId = undefined;
                       context.activeAgent = undefined;
                       context.activeVariant = undefined;
+                      context.lastTokens = null;
+                      context.lastCost = null;
+                      context.lastModel = null;
+                      context.modelUsage.clear();
                       yield* updateProviderSession(
                         context,
                         {
@@ -3056,6 +3060,10 @@ export function makeOpenCodeAdapter(
                     context.activeVariant = undefined;
                     context.awaitingBusyAfterInterruption = false;
                     context.reconcileIdleStatus = false;
+                    context.lastTokens = null;
+                    context.lastCost = null;
+                    context.lastModel = null;
+                    context.modelUsage.clear();
                     yield* updateProviderSession(
                       context,
                       {
