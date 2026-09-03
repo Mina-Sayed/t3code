@@ -10,6 +10,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -23,6 +24,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
+  type ProviderRuntimeEvent,
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 import { ServerConfig } from "../../config.ts";
@@ -5213,11 +5215,17 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         callID: "call_task_interrupt",
         tool: "task",
       };
-      const eventsFiber = yield* adapter.streamEvents.pipe(
+      const runningState = {
+        status: "running",
+        input: { description: "Summarize notes", subagent_type: "general" },
+        title: "Summarize notes",
+        time: { start: 1 },
+      };
+      const tapped = yield* Ref.make(new Array<ProviderRuntimeEvent>());
+      yield* adapter.streamEvents.pipe(
         Stream.filter((event) => event.threadId === threadId),
-        Stream.filter((event) => event.type.startsWith("task.")),
-        Stream.take(3),
-        Stream.runCollect,
+        Stream.tap((event) => Ref.update(tapped, (all) => [...all, event])),
+        Stream.runDrain,
         Effect.forkChild,
       );
 
@@ -5259,31 +5267,137 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         type: "message.part.updated",
         properties: {
           sessionID: "http://127.0.0.1:9999/session",
-          part: {
-            ...basePart,
-            state: {
-              status: "running",
-              input: { description: "Summarize notes", subagent_type: "general" },
-              title: "Summarize notes",
-              time: { start: 1 },
-            },
-          },
+          part: { ...basePart, state: runningState },
           time: 2,
         },
       });
       yield* Effect.yieldNow;
       yield* adapter.interruptTurn(threadId, turn.turnId);
-
-      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("5 seconds")));
-      NodeAssert.deepEqual(
-        events.map((event) => event.type),
-        ["task.started", "task.progress", "task.completed"],
-      );
-      const completed = events[2];
+      // Wait until the stopped row lands, then assert the exact lifecycle.
+      let taskTypes: Array<string> = [];
+      for (let flush = 0; flush < 100; flush += 1) {
+        const seen = yield* Ref.get(tapped);
+        taskTypes = seen
+          .filter((event) => event.type.startsWith("task."))
+          .map((event) => event.type);
+        if (taskTypes.includes("task.completed")) {
+          break;
+        }
+        yield* Effect.yieldNow;
+      }
+      NodeAssert.deepEqual(taskTypes, ["task.started", "task.progress", "task.completed"]);
+      const all = yield* Ref.get(tapped);
+      const completed = all.find((event) => event.type === "task.completed");
       if (completed?.type === "task.completed") {
         NodeAssert.equal(completed.payload.taskId, "call_task_interrupt");
         NodeAssert.equal(completed.payload.status, "stopped");
+      } else {
+        NodeAssert.fail("expected a task.completed event");
       }
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("ignores late running parts for settled opencode tasks", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-task-late-part");
+      const basePart = {
+        id: "part-task-late",
+        sessionID: "http://127.0.0.1:9999/session",
+        messageID: "msg-task-late",
+        type: "tool",
+        callID: "call_task_late",
+        tool: "task",
+      };
+      const input = { description: "Summarize notes", subagent_type: "general" };
+      // completed, then a delayed duplicate running part: without the
+      // settled guard the fold reads terminal→running as a reactivation and
+      // the row flips back to Working.
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            part: { ...basePart, state: { status: "pending", input: {}, raw: "" } },
+            time: 1,
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            part: {
+              ...basePart,
+              state: { status: "running", input, title: "Summarize notes", time: { start: 1 } },
+            },
+            time: 2,
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            part: {
+              ...basePart,
+              state: {
+                status: "completed",
+                input,
+                output: "Done.",
+                title: "Summarize notes",
+                metadata: {},
+                time: { start: 1, end: 2 },
+              },
+            },
+            time: 3,
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            part: {
+              ...basePart,
+              state: { status: "running", input, title: "Summarize notes", time: { start: 1 } },
+            },
+            time: 4,
+          },
+        },
+      ];
+      const tapped = yield* Ref.make(new Array<ProviderRuntimeEvent>());
+      yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.tap((event) => Ref.update(tapped, (all) => [...all, event])),
+        Stream.runDrain,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      // Wait until the late part's tool row lands, proving it was processed.
+      let taskTypes: Array<string> = [];
+      for (let flush = 0; flush < 100; flush += 1) {
+        const seen = yield* Ref.get(tapped);
+        const updates = seen.filter(
+          (event) => event.type === "item.updated" && event.itemId === "call_task_late",
+        );
+        taskTypes = seen
+          .filter((event) => event.type.startsWith("task."))
+          .map((event) => event.type);
+        if (updates.length >= 2 && taskTypes.includes("task.completed")) {
+          break;
+        }
+        yield* Effect.yieldNow;
+      }
+      NodeAssert.deepEqual(taskTypes, ["task.started", "task.progress", "task.completed"]);
+      const seen = yield* Ref.get(tapped);
+      const updates = seen.filter(
+        (event) => event.type === "item.updated" && event.itemId === "call_task_late",
+      );
+      NodeAssert.equal(updates.length >= 2, true);
       yield* adapter.stopSession(threadId);
     }),
   );

@@ -1125,7 +1125,10 @@ export function makeOpenCodeAdapter(
         case "running": {
           // `task.progress` requires a description; a running part whose
           // launch input has not arrived yet contributes nothing displayable.
-          if (seen.description === undefined) {
+          // A settled call never runs again: after interrupt (or a terminal
+          // part) a late running part must not resurrect the row — the fold
+          // reads terminal→running as a fresh activation.
+          if (seen.settled || seen.description === undefined) {
             return;
           }
           const summary = trimText(part.state.title);
