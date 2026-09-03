@@ -5183,6 +5183,111 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("settles in-flight opencode tasks when the turn is interrupted", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-task-interrupt");
+      const userMessageEvent = promiseWithResolvers<unknown>();
+      const pendingPartEvent = promiseWithResolvers<unknown>();
+      const runningPartEvent = promiseWithResolvers<unknown>();
+      runtimeMock.state.autoPromptEcho = false;
+      runtimeMock.state.subscribedEvents = [
+        userMessageEvent.promise,
+        pendingPartEvent.promise,
+        runningPartEvent.promise,
+      ];
+      runtimeMock.state.promptAsyncImplementation = async () => {
+        const prompt = runtimeMock.state.promptCalls.at(-1) as { messageID?: string } | undefined;
+        if (prompt?.messageID) {
+          runtimeMock.state.messages.push({
+            info: { id: prompt.messageID, role: "user" },
+            parts: [],
+          });
+        }
+      };
+      const basePart = {
+        id: "part-task-interrupt",
+        sessionID: "http://127.0.0.1:9999/session",
+        messageID: "msg-task-interrupt",
+        type: "tool",
+        callID: "call_task_interrupt",
+        tool: "task",
+      };
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.filter((event) => event.type.startsWith("task.")),
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "Spawn a subagent",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "opencode/kimi-k3",
+        ),
+      });
+      const turnMessageId = (runtimeMock.state.promptCalls.at(-1) as { messageID: string })
+        .messageID;
+      userMessageEvent.resolve({
+        id: "evt-user-interrupt-turn",
+        type: "message.updated",
+        properties: {
+          sessionID: "http://127.0.0.1:9999/session",
+          info: { id: turnMessageId, role: "user" },
+        },
+      });
+      yield* Effect.yieldNow;
+      pendingPartEvent.resolve({
+        id: "evt-part-pending-interrupt",
+        type: "message.part.updated",
+        properties: {
+          sessionID: "http://127.0.0.1:9999/session",
+          part: { ...basePart, state: { status: "pending", input: {}, raw: "" } },
+          time: 1,
+        },
+      });
+      runningPartEvent.resolve({
+        id: "evt-part-running-interrupt",
+        type: "message.part.updated",
+        properties: {
+          sessionID: "http://127.0.0.1:9999/session",
+          part: {
+            ...basePart,
+            state: {
+              status: "running",
+              input: { description: "Summarize notes", subagent_type: "general" },
+              title: "Summarize notes",
+              time: { start: 1 },
+            },
+          },
+          time: 2,
+        },
+      });
+      yield* Effect.yieldNow;
+      yield* adapter.interruptTurn(threadId, turn.turnId);
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("5 seconds")));
+      NodeAssert.deepEqual(
+        events.map((event) => event.type),
+        ["task.started", "task.progress", "task.completed"],
+      );
+      const completed = events[2];
+      if (completed?.type === "task.completed") {
+        NodeAssert.equal(completed.payload.taskId, "call_task_interrupt");
+        NodeAssert.equal(completed.payload.status, "stopped");
+      }
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("lets OpenCode own session title generation and emits title metadata updates", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;

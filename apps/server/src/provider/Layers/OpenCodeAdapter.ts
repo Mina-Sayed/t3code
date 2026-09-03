@@ -325,6 +325,12 @@ interface OpenCodeTaskLinkage {
   description: string | undefined;
   role: string | undefined;
   startedEmitted: boolean;
+  /**
+   * True once a terminal `task.completed` went out for this call — either
+   * from its own completed/error part or from turn interruption settling.
+   * Guards both duplicate completions and repeat interruption sweeps.
+   */
+  settled: boolean;
 }
 
 interface OpenCodeSessionContext {
@@ -1079,6 +1085,7 @@ export function makeOpenCodeAdapter(
         description: undefined,
         role: undefined,
         startedEmitted: false,
+        settled: false,
       };
       const inputLinkage = describeOpenCodeTaskToolInput(part.state.input);
       if (inputLinkage.description !== undefined) {
@@ -1142,6 +1149,10 @@ export function makeOpenCodeAdapter(
         }
         case "completed":
         case "error": {
+          if (seen.settled) {
+            return;
+          }
+          seen.settled = true;
           const terminal =
             part.state.status === "completed"
               ? {
@@ -1584,6 +1595,33 @@ export function makeOpenCodeAdapter(
           reason: "Interrupted by user.",
         },
       });
+      // Settle in-flight subagents: Stop leaves the session live, so the
+      // client fold cannot derive interruption from session death (it only
+      // does that when the session disconnects). Mirror Claude's teardown
+      // sweep: one terminal row per unsettled call.
+      for (const [callId, task] of context.taskAgents) {
+        if (task.settled) {
+          continue;
+        }
+        task.settled = true;
+        yield* emit({
+          ...(yield* buildEventBase({
+            threadId: context.session.threadId,
+            turnId,
+            raw,
+          })),
+          type: "task.completed",
+          payload: {
+            taskId: RuntimeTaskId.make(callId),
+            status: "stopped" as const,
+            ...(task.description !== undefined
+              ? { description: task.description, title: task.description }
+              : {}),
+            ...(task.role !== undefined ? { role: task.role } : {}),
+            toolUseId: callId,
+          },
+        });
+      }
       if (cancellation) {
         yield* Deferred.succeed(cancellation.completion, undefined).pipe(Effect.ignore);
       }
