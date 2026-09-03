@@ -10,6 +10,27 @@ confirmation applies to the sidebar controls, thread menus, and the `mod+shift+p
 Pinned threads still move to **Settled** when they become inactive. They also move when their pull
 request merges if **Auto-settle merged threads** is enabled.
 
+Each server stores its own copy of the automatic settlement settings and checks them even when no
+web, desktop, or mobile client is connected. By default, it settles threads after three days without
+activity and when their pull request merges. An eligible idle thread also settles when its pull
+request closes. An open pull request blocks inactivity settlement. Active work, pending input, and
+live background work keep the thread active. T3 Code settles from a closed or merged pull request
+only when its timestamp is not older than the user's latest activity. If that timestamp is not
+available, the inactivity rule still applies. A manual un-settle also keeps the thread active.
+
+**Settled** lists threads by when their work finished, newest first. A thread you settle yourself
+sorts by the moment you settled it. A thread that settled on its own sorts by its last message or
+turn, not by when the server noticed it was inactive.
+
+Change these rules in **Settings > General**. The change is written to every environment you are
+connected to at that moment. An environment that is offline keeps its old value. When a connected
+environment holds a different value, **Settings > General** shows a warning that names it. Choose
+**Apply to all** to write your current values to every connected environment. The same applies to
+the new-thread workspace mode and the source control writing style.
+
+A settings change affects future settlement and does not reopen a settled thread. Settings saved
+by older clients on one device no longer control this behavior.
+
 When you un-settle a thread, it returns to the top of the active list so you can find it right
 away. Its timestamps do not change. Other threads keep their positions.
 
@@ -24,6 +45,13 @@ other connected devices.
 If reordering is unavailable for one environment, update the T3 Code server running in that
 environment. Older servers can still pin and unpin threads, but do not understand synced ordering;
 their pinned threads keep the default newest-first order below the ones you have arranged.
+
+## Panel motion
+
+The main sidebar, right panel, and terminal drawer open and close immediately by default. Under
+**Settings → Appearance → Motion**, move the **Panel animations** slider above 0 ms to add motion.
+The duration can be set up to 400 ms. Clicking the preview replays all three panel transitions; at
+0 ms, it snaps between the same open and closed states.
 
 ## Environment artwork
 
