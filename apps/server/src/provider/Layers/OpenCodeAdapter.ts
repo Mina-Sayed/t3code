@@ -7,6 +7,7 @@ import {
   type ProviderSession,
   RuntimeItemId,
   RuntimeRequestId,
+  RuntimeTaskId,
   ThreadId,
   type ToolLifecycleItemType,
   TurnId,
@@ -320,6 +321,12 @@ function isOpenCodeDefaultTitle(title: string): boolean {
   return OPENCODE_DEFAULT_TITLE_PATTERN.test(title);
 }
 
+interface OpenCodeTaskLinkage {
+  description: string | undefined;
+  role: string | undefined;
+  startedEmitted: boolean;
+}
+
 interface OpenCodeSessionContext {
   session: ProviderSession;
   readonly client: OpencodeClient;
@@ -327,6 +334,15 @@ interface OpenCodeSessionContext {
   readonly directory: string;
   readonly openCodeSessionId: string;
   readonly relatedSessionIds: Set<string>;
+  /**
+   * Agent identity per `task`-tool call, keyed by the tool's stable call id.
+   * OpenCode reports a subagent as plain tool parts (pending → running →
+   * completed); the Agents surface only folds `task.*` activities, so the
+   * adapter re-emits that lifecycle from these parts. The record remembers
+   * the launch input (description/role arrive after the pending part) and
+   * whether `task.started` was already emitted for idempotency.
+   */
+  readonly taskAgents: Map<string, OpenCodeTaskLinkage>;
   readonly resolvedRequestIds: Set<string>;
   readonly emittedTerminalRequestIds: Set<string>;
   readonly requestRelationRetries: Map<string, OpenCodeRequestRelationRetry>;
@@ -588,6 +604,35 @@ export function appendOpenCodeAssistantTextDelta(
     nextText: previousText + delta,
     deltaToEmit: delta,
   };
+}
+
+/**
+ * Reads the `task`-tool launch input into agent linkage. The pending part
+ * commonly carries an empty input object; the description and subagent type
+ * arrive on later updates, so callers merge this into the per-call record
+ * instead of replacing it. Exported for unit testing.
+ */
+export function describeOpenCodeTaskToolInput(input: { readonly [key: string]: unknown }): {
+  readonly description: string | undefined;
+  readonly role: string | undefined;
+} {
+  return {
+    description: trimText(typeof input.description === "string" ? input.description : undefined),
+    role: trimText(typeof input.subagent_type === "string" ? input.subagent_type : undefined),
+  };
+}
+
+/**
+ * Unwraps the `task`-tool result envelope (`<task …><task_result>…`) into
+ * the subagent's own summary for the Agents surface. Unknown shapes pass
+ * through untouched. Exported for unit testing.
+ */
+export function summarizeOpenCodeTaskToolOutput(output: string): string {
+  const inner = /<task_result>([\s\S]*?)<\/task_result>/i.exec(output)?.[1];
+  const unwrapped = (inner ?? output)
+    .replace(/^<task\b[^>]*>\s*/i, "")
+    .replace(/\s*<\/task>\s*$/i, "");
+  return unwrapped.trim();
 }
 
 const isoFromEpochMs = (value: number) =>
@@ -1014,6 +1059,117 @@ export function makeOpenCodeAdapter(
         readonly event: Record<string, unknown>;
       },
     ) => writeNativeEvent(threadId, event).pipe(Effect.catchCause(() => Effect.void));
+
+    /**
+     * Re-emits the `task`-tool part lifecycle as `task.*` runtime events so
+     * subagents show up in the Agents surface. OpenCode reports a subagent
+     * as plain tool parts (pending → running → completed/error) with the
+     * launch input (`description`, `subagent_type`) filling in after the
+     * pending part; the per-call record in `context.taskAgents` carries that
+     * identity forward. The existing `item.*` tool row is left untouched.
+     */
+    const emitOpenCodeTaskLifecycle = Effect.fn("emitOpenCodeTaskLifecycle")(function* (
+      context: OpenCodeSessionContext,
+      part: Extract<Part, { type: "tool" }>,
+      turnId: TurnId | undefined,
+      raw: unknown,
+    ) {
+      const callId = part.callID;
+      const seen = context.taskAgents.get(callId) ?? {
+        description: undefined,
+        role: undefined,
+        startedEmitted: false,
+      };
+      const inputLinkage = describeOpenCodeTaskToolInput(part.state.input);
+      if (inputLinkage.description !== undefined) {
+        seen.description = inputLinkage.description;
+      }
+      if (inputLinkage.role !== undefined) {
+        seen.role = inputLinkage.role;
+      }
+      context.taskAgents.set(callId, seen);
+      const taskId = RuntimeTaskId.make(callId);
+      const linkage = {
+        ...(seen.description !== undefined
+          ? { description: seen.description, title: seen.description }
+          : {}),
+        ...(seen.role !== undefined ? { role: seen.role } : {}),
+        toolUseId: callId,
+      };
+      const threadId = context.session.threadId;
+      switch (part.state.status) {
+        case "pending": {
+          if (seen.startedEmitted) {
+            return;
+          }
+          seen.startedEmitted = true;
+          yield* emit({
+            ...(yield* buildEventBase({
+              threadId,
+              turnId,
+              createdAt: toolStateCreatedAt(part),
+              raw,
+            })),
+            type: "task.started",
+            payload: { taskId, ...linkage },
+          });
+          return;
+        }
+        case "running": {
+          // `task.progress` requires a description; a running part whose
+          // launch input has not arrived yet contributes nothing displayable.
+          if (seen.description === undefined) {
+            return;
+          }
+          const summary = trimText(part.state.title);
+          yield* emit({
+            ...(yield* buildEventBase({
+              threadId,
+              turnId,
+              createdAt: toolStateCreatedAt(part),
+              raw,
+            })),
+            type: "task.progress",
+            payload: {
+              taskId,
+              description: seen.description,
+              ...(summary !== undefined ? { summary } : {}),
+              status: "running" as const,
+              ...linkage,
+            },
+          });
+          return;
+        }
+        case "completed":
+        case "error": {
+          const terminal =
+            part.state.status === "completed"
+              ? {
+                  status: "completed" as const,
+                  summary: trimText(summarizeOpenCodeTaskToolOutput(part.state.output)),
+                }
+              : { status: "failed" as const, summary: trimText(part.state.error) };
+          yield* emit({
+            ...(yield* buildEventBase({
+              threadId,
+              turnId,
+              createdAt: toolStateCreatedAt(part),
+              raw,
+            })),
+            type: "task.completed",
+            payload: {
+              taskId,
+              status: terminal.status,
+              ...(terminal.summary !== undefined ? { summary: terminal.summary } : {}),
+              ...linkage,
+            },
+          });
+          return;
+        }
+        default:
+          return;
+      }
+    });
 
     const cancelIdleReconciliation = Effect.fn("cancelIdleReconciliation")(function* (
       context: OpenCodeSessionContext,
@@ -2142,6 +2298,9 @@ export function makeOpenCodeAdapter(
             };
             appendTurnItem(context, turnId, part);
             yield* emit(runtimeEvent);
+            if (part.tool === "task") {
+              yield* emitOpenCodeTaskLifecycle(context, part, turnId, event);
+            }
           }
           break;
         }
@@ -2553,6 +2712,7 @@ export function makeOpenCodeAdapter(
           directory,
           openCodeSessionId: started.openCodeSession.id,
           relatedSessionIds: new Set([started.openCodeSession.id]),
+          taskAgents: new Map(),
           resolvedRequestIds: new Set(),
           emittedTerminalRequestIds: new Set(),
           requestRelationRetries: new Map(),

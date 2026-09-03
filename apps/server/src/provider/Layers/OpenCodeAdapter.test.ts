@@ -36,10 +36,12 @@ import {
 } from "../opencodeRuntime.ts";
 import {
   appendOpenCodeAssistantTextDelta,
+  describeOpenCodeTaskToolInput,
   isOpenCodeNotFound,
   isSameOpenCodeDirectory,
   makeOpenCodeAdapter,
   mergeOpenCodeAssistantText,
+  summarizeOpenCodeTaskToolOutput,
 } from "./OpenCodeAdapter.ts";
 
 // Test-local service tag so the rest of the file can keep using `yield* OpenCodeAdapter`.
@@ -5028,6 +5030,156 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       if (completed?.type === "item.completed") {
         NodeAssert.equal(completed.payload.detail, "A BBonus");
       }
+    }),
+  );
+
+  it.effect("reads opencode task tool launch input and unwraps task results", () =>
+    Effect.sync(() => {
+      NodeAssert.deepEqual(describeOpenCodeTaskToolInput({}), {
+        description: undefined,
+        role: undefined,
+      });
+      NodeAssert.deepEqual(
+        describeOpenCodeTaskToolInput({
+          description: "  Implement snake game files ",
+          prompt: "Create snake.html",
+          subagent_type: "general",
+        }),
+        { description: "Implement snake game files", role: "general" },
+      );
+      NodeAssert.equal(
+        summarizeOpenCodeTaskToolOutput(
+          '<task id="ses_child" state="completed">\n<task_result>\nDone.\n</task_result>\n</task>',
+        ),
+        "Done.",
+      );
+      NodeAssert.equal(summarizeOpenCodeTaskToolOutput("plain output"), "plain output");
+    }),
+  );
+
+  it.effect("emits task lifecycle events for the opencode task tool", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-task-tool-agents");
+      const basePart = {
+        id: "part-task-agents",
+        sessionID: "http://127.0.0.1:9999/session",
+        messageID: "msg-task-agents",
+        type: "tool",
+        callID: "call_task_agents",
+        tool: "task",
+      };
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            part: { ...basePart, state: { status: "pending", input: {}, raw: "" } },
+            time: 1,
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            part: {
+              ...basePart,
+              state: {
+                status: "running",
+                input: {
+                  description: "Implement snake game files",
+                  subagent_type: "general",
+                },
+                title: "Implement snake game files",
+                time: { start: 1 },
+              },
+            },
+            time: 2,
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            part: {
+              ...basePart,
+              state: {
+                status: "completed",
+                input: {
+                  description: "Implement snake game files",
+                  subagent_type: "general",
+                },
+                output:
+                  '<task id="ses_child" state="completed">\n<task_result>\nDone.\n</task_result>\n</task>',
+                title: "Implement snake game files",
+                metadata: {},
+                time: { start: 1, end: 2 },
+              },
+            },
+            time: 3,
+          },
+        },
+        // Non-agent tool parts must not produce task lifecycle events.
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            part: {
+              id: "part-read-control",
+              sessionID: "http://127.0.0.1:9999/session",
+              messageID: "msg-task-agents",
+              type: "tool",
+              callID: "call_read_control",
+              tool: "read",
+              state: {
+                status: "completed",
+                input: {},
+                output: "notes.txt",
+                title: "read",
+                metadata: {},
+                time: { start: 1, end: 2 },
+              },
+            },
+            time: 4,
+          },
+        },
+      ];
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.filter((event) => event.type.startsWith("task.")),
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("5 seconds")));
+      NodeAssert.deepEqual(
+        events.map((event) => event.type),
+        ["task.started", "task.progress", "task.completed"],
+      );
+      const started = events[0];
+      if (started?.type === "task.started") {
+        NodeAssert.equal(started.payload.taskId, "call_task_agents");
+        NodeAssert.equal(started.payload.toolUseId, "call_task_agents");
+      }
+      const progress = events[1];
+      if (progress?.type === "task.progress") {
+        NodeAssert.equal(progress.payload.description, "Implement snake game files");
+        NodeAssert.equal(progress.payload.role, "general");
+        NodeAssert.equal(progress.payload.status, "running");
+      }
+      const completed = events[2];
+      if (completed?.type === "task.completed") {
+        NodeAssert.equal(completed.payload.status, "completed");
+        NodeAssert.equal(completed.payload.summary, "Done.");
+      }
+      yield* adapter.stopSession(threadId);
     }),
   );
 
