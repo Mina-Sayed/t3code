@@ -338,6 +338,20 @@ interface OpenCodeSessionContext {
   activeTurnId: TurnId | undefined;
   activeAgent: string | undefined;
   activeVariant: string | undefined;
+  lastTokens: OpenCodeTokens | null;
+  lastCost: number | null;
+  lastModel: string | null;
+  /** Accumulated per-model tokens for the active turn, for `modelUsage`. */
+  modelUsage: Map<string, OpenCodeTokens>;
+  /** Dedupe map for token-bearing events within the active turn, keyed by message/part id. */
+  tokenDedupeMap: Map<
+    string,
+    { tokens: OpenCodeTokens; cost: number | null; modelKey: string | null }
+  >;
+  /** Counter for generic token events without a stable id. */
+  dedupeCounter: number;
+  /** Persistent map from dedupeKey to the turn that created it, for stale-event detection. */
+  messageTurnMap: Map<string, TurnId>;
   cancellation: OpenCodeCancellation | undefined;
   interruptedTurnId: TurnId | undefined;
   reconcileIdleStatus: boolean;
@@ -639,6 +653,73 @@ function sessionErrorMessage(error: unknown): string {
     : "OpenCode session failed.";
 }
 
+interface OpenCodeTokens {
+  readonly input: number;
+  readonly output: number;
+  readonly reasoning: number;
+  readonly cache: { readonly read: number; readonly write: number };
+  readonly total?: number;
+}
+
+function readOpenCodeTokens(value: unknown): OpenCodeTokens | null {
+  if (typeof value !== "object" || value === null) return null;
+  const record = value as Record<string, unknown>;
+  const input = typeof record.input === "number" ? record.input : null;
+  const output = typeof record.output === "number" ? record.output : null;
+  if (input === null || output === null) return null;
+  const reasoning = typeof record.reasoning === "number" ? record.reasoning : 0;
+  const cacheRaw = record.cache;
+  let cacheRead = 0;
+  let cacheWrite = 0;
+  if (typeof cacheRaw === "object" && cacheRaw !== null) {
+    const cache = cacheRaw as Record<string, unknown>;
+    cacheRead = typeof cache.read === "number" ? cache.read : 0;
+    cacheWrite = typeof cache.write === "number" ? cache.write : 0;
+  }
+  const total = typeof record.total === "number" ? record.total : undefined;
+  return {
+    input,
+    output,
+    reasoning,
+    cache: { read: cacheRead, write: cacheWrite },
+    ...(total !== undefined ? { total } : {}),
+  };
+}
+
+function openCodeTokensToSnapshot(tokens: OpenCodeTokens): {
+  readonly usedTokens: number;
+  readonly inputTokens: number;
+  readonly cachedInputTokens: number;
+  readonly outputTokens: number;
+  readonly reasoningOutputTokens: number;
+} {
+  // OpenCode reports `input` exclusive of cache (unlike Codex/Grok). Don't subtract.
+  const cachedInputTokens = tokens.cache.read;
+  const inputTokens = tokens.input;
+  const usedTokens =
+    tokens.total ?? tokens.input + tokens.output + tokens.cache.read + tokens.cache.write;
+  return {
+    usedTokens: Math.max(0, usedTokens),
+    inputTokens,
+    cachedInputTokens,
+    outputTokens: tokens.output,
+    reasoningOutputTokens: Math.min(tokens.output, tokens.reasoning),
+  };
+}
+
+function mergeOpenCodeTokens(a: OpenCodeTokens, b: OpenCodeTokens): OpenCodeTokens {
+  const totalA = a.total ?? a.input + a.output + a.cache.read + a.cache.write;
+  const totalB = b.total ?? b.input + b.output + b.cache.read + b.cache.write;
+  const hasTotal = a.total !== undefined || b.total !== undefined;
+  return {
+    input: a.input + b.input,
+    output: a.output + b.output,
+    reasoning: a.reasoning + b.reasoning,
+    cache: { read: a.cache.read + b.cache.read, write: a.cache.write + b.cache.write },
+    ...(hasTotal ? { total: totalA + totalB } : {}),
+  };
+}
+
 function updateProviderSession(
   context: OpenCodeSessionContext,
   patch: Partial<ProviderSession>,
@@ -931,6 +1012,127 @@ export function makeOpenCodeAdapter(
       },
     ) => writeNativeEvent(threadId, event).pipe(Effect.catchCause(() => Effect.void));
 
+    const emitOpenCodeTokenUsage = Effect.fn("emitOpenCodeTokenUsage")(function* (
+      context: OpenCodeSessionContext,
+      tokens: OpenCodeTokens,
+      turnId: TurnId | undefined,
+      raw: unknown,
+      cost?: unknown,
+      model?: unknown,
+      providerId?: unknown,
+      dedupeKey?: string,
+    ) {
+      if (
+        tokens.input + tokens.output + tokens.cache.read + tokens.cache.write === 0 &&
+        tokens.total === undefined
+      ) {
+        return;
+      }
+      const snapshot = openCodeTokensToSnapshot(tokens);
+      if (snapshot.usedTokens <= 0) return;
+      // Guard: only accumulate for the active turn. Delayed events with
+      // undefined or stale turnId would otherwise repopulate after completion
+      // and leak into the next turn (see filtered issue at line 1026).
+      const isActiveTurn = turnId !== undefined && turnId === context.activeTurnId;
+      if (!isActiveTurn) {
+        yield* emit({
+          ...(yield* buildEventBase({
+            threadId: context.session.threadId,
+            turnId,
+            raw,
+          })),
+          type: "thread.token-usage.updated",
+          payload: { usage: snapshot },
+        });
+        return;
+      }
+      // Dedupe by message/part id to avoid double-counting when OpenCode
+      // re-emits `message.updated` with cumulative totals for the same id.
+      let costValue: number | null =
+        typeof cost === "number" && Number.isFinite(cost) ? cost : null;
+      let modelKey: string | null = null;
+      if (typeof model === "string" && model.trim().length > 0) {
+        const provider =
+          typeof providerId === "string" && providerId.trim().length > 0
+            ? providerId.trim()
+            : "opencode";
+        modelKey = `${provider}/${model.trim()}`;
+      } else if (typeof model === "object" && model !== null) {
+        const record = model as Record<string, unknown>;
+        const id =
+          typeof record.id === "string"
+            ? record.id
+            : typeof record.modelID === "string"
+              ? record.modelID
+              : null;
+        const prov =
+          typeof record.providerID === "string"
+            ? record.providerID
+            : typeof record.provider === "string"
+              ? record.provider
+              : "opencode";
+        if (id) modelKey = `${prov}/${id}`;
+      }
+      // Stale-event guard: if this dedupeKey was already seen for a different
+      // turn, this is a late event from a prior turn that would otherwise
+      // contaminate the new turn's totals.
+      if (dedupeKey) {
+        const existingTurnId = context.messageTurnMap.get(dedupeKey);
+        if (existingTurnId !== undefined) {
+          if (existingTurnId !== turnId) {
+            yield* emit({
+              ...(yield* buildEventBase({
+                threadId: context.session.threadId,
+                turnId,
+                raw,
+              })),
+              type: "thread.token-usage.updated",
+              payload: { usage: snapshot },
+            });
+            return;
+          }
+        } else {
+          context.messageTurnMap.set(dedupeKey, turnId);
+        }
+      }
+      const key = dedupeKey ?? `generic:${context.dedupeCounter++}`;
+      context.tokenDedupeMap.set(key, { tokens, cost: costValue, modelKey });
+      // Recompute aggregated totals from the dedupe map.
+      let aggTokens: OpenCodeTokens | null = null;
+      let aggCostSum = 0;
+      let hasCost = false;
+      const newModelUsage = new Map<string, OpenCodeTokens>();
+      for (const entry of context.tokenDedupeMap.values()) {
+        if (aggTokens === null) aggTokens = entry.tokens;
+        else aggTokens = mergeOpenCodeTokens(aggTokens, entry.tokens);
+        if (entry.cost !== null) {
+          aggCostSum += entry.cost;
+          hasCost = true;
+        }
+        if (entry.modelKey) {
+          const existing = newModelUsage.get(entry.modelKey);
+          if (existing)
+            newModelUsage.set(entry.modelKey, mergeOpenCodeTokens(existing, entry.tokens));
+          else newModelUsage.set(entry.modelKey, entry.tokens);
+        }
+      }
+      context.lastTokens = aggTokens;
+      context.lastCost = hasCost ? aggCostSum : null;
+      if (modelKey) context.lastModel = modelKey;
+      context.modelUsage = newModelUsage;
+      yield* emit({
+        ...(yield* buildEventBase({
+          threadId: context.session.threadId,
+          turnId,
+          raw,
+        })),
+        type: "thread.token-usage.updated",
+        payload: {
+          usage: snapshot,
+        },
+      });
+    });
+
     const cancelIdleReconciliation = Effect.fn("cancelIdleReconciliation")(function* (
       context: OpenCodeSessionContext,
     ) {
@@ -979,6 +1181,22 @@ export function makeOpenCodeAdapter(
       if (pendingIdleReconciliation?.fiber) {
         yield* Fiber.interrupt(pendingIdleReconciliation.fiber);
       }
+      const usage = context.lastTokens;
+      const cost = context.lastCost;
+      const model = context.lastModel;
+      const modelUsageEntries = [...context.modelUsage.entries()];
+      context.lastTokens = null;
+      context.lastCost = null;
+      context.lastModel = null;
+      context.modelUsage.clear();
+      context.tokenDedupeMap.clear();
+      context.dedupeCounter = 0;
+      const modelUsage =
+        modelUsageEntries.length > 0
+          ? Object.fromEntries(modelUsageEntries)
+          : model && usage
+            ? { [model]: usage }
+            : undefined;
       yield* emit({
         ...(yield* buildEventBase({
           threadId: context.session.threadId,
@@ -988,6 +1206,13 @@ export function makeOpenCodeAdapter(
         type: "turn.completed",
         payload: {
           state: "completed",
+          ...(usage
+            ? {
+                usage,
+                ...(modelUsage ? { modelUsage } : {}),
+              }
+            : {}),
+          ...(cost !== null ? { totalCostUsd: cost } : {}),
         },
       });
     });
@@ -1131,6 +1356,13 @@ export function makeOpenCodeAdapter(
       context.activeVariant = undefined;
       context.awaitingBusyAfterInterruption = false;
       context.reconcileIdleStatus = false;
+      // Clear pending usage so it does not leak to the next turn.
+      context.lastTokens = null;
+      context.lastCost = null;
+      context.lastModel = null;
+      context.modelUsage.clear();
+      context.tokenDedupeMap.clear();
+      context.dedupeCounter = 0;
       yield* updateProviderSession(
         context,
         { status: "error", lastError: detail },
@@ -1323,6 +1555,13 @@ export function makeOpenCodeAdapter(
       if (cancellation) {
         context.cancellation = undefined;
       }
+      // Clear any pending usage so it does not leak to the next turn.
+      context.lastTokens = null;
+      context.lastCost = null;
+      context.lastModel = null;
+      context.modelUsage.clear();
+      context.tokenDedupeMap.clear();
+      context.dedupeCounter = 0;
       if (context.activeTurnId === turnId) {
         context.activeTurnId = undefined;
         context.activeAgent = undefined;
@@ -1958,6 +2197,21 @@ export function makeOpenCodeAdapter(
               }
               yield* emitAssistantTextDelta(context, part, turnId, event);
             }
+            const info = event.properties.info as unknown as Record<string, unknown>;
+            const tokens = readOpenCodeTokens(info.tokens);
+            if (tokens) {
+              const dedupeKey = typeof info.id === "string" ? `msg:${info.id}` : undefined;
+              yield* emitOpenCodeTokenUsage(
+                context,
+                tokens,
+                turnId,
+                event,
+                info.cost,
+                (info.modelID as string | undefined) ?? (info.model as unknown),
+                info.providerID as string | undefined,
+                dedupeKey,
+              );
+            }
           }
           break;
         }
@@ -2019,6 +2273,24 @@ export function makeOpenCodeAdapter(
 
           if (messageRole === "assistant") {
             yield* emitAssistantTextDelta(context, part, turnId, event);
+          }
+
+          {
+            const partRecord = part as unknown as Record<string, unknown>;
+            const tokens = readOpenCodeTokens(partRecord.tokens);
+            if (tokens) {
+              const dedupeKey = typeof part.id === "string" ? `part:${part.id}` : undefined;
+              yield* emitOpenCodeTokenUsage(
+                context,
+                tokens,
+                turnId,
+                event,
+                partRecord.cost,
+                (partRecord.modelID as string | undefined) ?? (partRecord.model as unknown),
+                partRecord.providerID as string | undefined,
+                dedupeKey,
+              );
+            }
           }
 
           if (part.type === "tool") {
@@ -2176,6 +2448,13 @@ export function makeOpenCodeAdapter(
           context.activeAgent = undefined;
           context.activeVariant = undefined;
           context.reconcileIdleStatus = false;
+          // Clear pending usage so it does not leak to the next turn.
+          context.lastTokens = null;
+          context.lastCost = null;
+          context.lastModel = null;
+          context.modelUsage.clear();
+          context.tokenDedupeMap.clear();
+          context.dedupeCounter = 0;
           yield* updateProviderSession(
             context,
             {
@@ -2213,8 +2492,61 @@ export function makeOpenCodeAdapter(
           break;
         }
 
-        default:
+        default: {
+          // Generic token extraction for events like `session.next.step.ended`, `session.diff`, etc.
+          // These carry `tokens`/`cost`/`model` at top-level properties or nested.
+          const props = (event as Record<string, unknown>).properties as
+            | Record<string, unknown>
+            | undefined;
+          if (props) {
+            const tokens =
+              readOpenCodeTokens(props.tokens) ??
+              readOpenCodeTokens((props.part as Record<string, unknown> | undefined)?.tokens) ??
+              readOpenCodeTokens((props.info as Record<string, unknown> | undefined)?.tokens) ??
+              null;
+            if (tokens) {
+              const cost =
+                (props.cost as number | undefined) ??
+                (props.info as Record<string, unknown> | undefined)?.cost ??
+                (props.part as Record<string, unknown> | undefined)?.cost;
+              const model =
+                (props.model as unknown) ??
+                (props.info as Record<string, unknown> | undefined)?.model ??
+                (props.info as Record<string, unknown> | undefined)?.modelID ??
+                (props.part as Record<string, unknown> | undefined)?.modelID;
+              const providerId =
+                (props.providerID as string | undefined) ??
+                (props.info as Record<string, unknown> | undefined)?.providerID ??
+                (props.part as Record<string, unknown> | undefined)?.providerID;
+              yield* emitOpenCodeTokenUsage(
+                context,
+                tokens,
+                turnId,
+                event,
+                cost,
+                model,
+                providerId,
+              );
+            } else {
+              const data = props.data as Record<string, unknown> | undefined;
+              if (data) {
+                const nestedTokens = readOpenCodeTokens(data.tokens);
+                if (nestedTokens) {
+                  yield* emitOpenCodeTokenUsage(
+                    context,
+                    nestedTokens,
+                    turnId,
+                    event,
+                    data.cost,
+                    (data.modelID as string | undefined) ?? (data.model as unknown),
+                    data.providerID as string | undefined,
+                  );
+                }
+              }
+            }
+          }
           break;
+        }
       }
     });
 
@@ -2474,6 +2806,13 @@ export function makeOpenCodeAdapter(
           activeTurnId: undefined,
           activeAgent: undefined,
           activeVariant: undefined,
+          lastTokens: null,
+          lastCost: null,
+          lastModel: null,
+          modelUsage: new Map(),
+          tokenDedupeMap: new Map(),
+          dedupeCounter: 0,
+          messageTurnMap: new Map(),
           cancellation: undefined,
           interruptedTurnId: undefined,
           reconcileIdleStatus: false,
@@ -2642,6 +2981,17 @@ export function makeOpenCodeAdapter(
           context.promptGeneration = promptGeneration;
           context.promptAdmission = promptAdmission;
 
+          // Fresh turn — clear any stale accumulated usage from a prior turn
+          // that may have been repopulated by a delayed event (see line 1026).
+          if (steeringTurnId === undefined) {
+            context.lastTokens = null;
+            context.lastCost = null;
+            context.lastModel = null;
+            context.modelUsage.clear();
+            context.tokenDedupeMap.clear();
+            context.dedupeCounter = 0;
+          }
+
           context.activeTurnId = turnId;
           context.activeAgent = agent ?? (input.interactionMode === "plan" ? "plan" : undefined);
           context.activeVariant = variant;
@@ -2731,6 +3081,12 @@ export function makeOpenCodeAdapter(
                       context.activeTurnId = undefined;
                       context.activeAgent = undefined;
                       context.activeVariant = undefined;
+                      context.lastTokens = null;
+                      context.lastCost = null;
+                      context.lastModel = null;
+                      context.modelUsage.clear();
+                      context.tokenDedupeMap.clear();
+                      context.dedupeCounter = 0;
                       yield* updateProviderSession(
                         context,
                         {
@@ -2777,6 +3133,12 @@ export function makeOpenCodeAdapter(
                     context.activeVariant = undefined;
                     context.awaitingBusyAfterInterruption = false;
                     context.reconcileIdleStatus = false;
+                    context.lastTokens = null;
+                    context.lastCost = null;
+                    context.lastModel = null;
+                    context.modelUsage.clear();
+                    context.tokenDedupeMap.clear();
+                    context.dedupeCounter = 0;
                     yield* updateProviderSession(
                       context,
                       {
