@@ -18,35 +18,32 @@ jobs:
           ref: fix/claude-meter-8594
           fetch-depth: 0
 
-      - name: Apply minimal current-turn usage fix
-        shell: bash
-        run: |
-          set -euo pipefail
-          git remote add upstream https://github.com/pingdotgg/t3code.git 2>/dev/null || true
-          git fetch upstream main
-          git checkout upstream/main -- apps/server/src/provider/Layers/ClaudeAdapter.ts
-          python -c 'from pathlib import Path; p=Path("apps/server/src/provider/Layers/ClaudeAdapter.ts"); s=p.read_text(); old="      const snapshot = normalizeClaudeActiveTokenUsage(\n        event.usage,\n        context.lastKnownContextWindow,\n        context.lastKnownTotalProcessedTokens,\n      );\n      yield* emitThreadTokenUsage(context, snapshot, {\n"; new="      const snapshot = normalizeClaudeActiveTokenUsage(\n        event.usage,\n        context.lastKnownContextWindow,\n        context.lastKnownTotalProcessedTokens,\n      );\n      if (snapshot !== undefined && context.turnState) {\n        context.turnState.latestAssistantUsage = event.usage;\n        context.turnState.compactedSinceLatestAssistantUsage = false;\n      }\n      yield* emitThreadTokenUsage(context, snapshot, {\n"; c=s.count(old); assert c == 1, f"expected one parent message_delta usage block, found {c}"; p.write_text(s.replace(old,new))'
-          git diff --check
-
       - uses: voidzero-dev/setup-vp@v1
         with:
           node-version-file: package.json
           cache: true
           run-install: true
 
+      - name: Normalize regression test formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          vp fmt apps/server/src/provider/Layers/ClaudeAdapter.usageRegression.test.ts
+          git diff --check
+
       - name: Run focused Claude adapter tests
         run: vp test run apps/server/src/provider/Layers/ClaudeAdapter.usageRegression.test.ts apps/server/src/provider/Layers/ClaudeAdapter.test.ts
 
-      - name: Commit validated fix to PR branch
+      - name: Commit formatting if needed
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "Mina Sayed"
           git config user.email "26074858+Mina-Sayed@users.noreply.github.com"
-          git add apps/server/src/provider/Layers/ClaudeAdapter.ts
+          git add apps/server/src/provider/Layers/ClaudeAdapter.usageRegression.test.ts
           if git diff --cached --quiet; then
-            echo "No production diff to push"
+            echo "No formatting changes"
             exit 0
           fi
-          git commit -m "fix(server): track parent Claude delta usage per turn"
+          git commit -m "test(server): format Claude usage regression coverage"
           git push origin HEAD:fix/claude-meter-8594
