@@ -1,0 +1,25 @@
+name: Validate 8617
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: fix/claude-meter-8594
+      - uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+      - name: Run Claude usage regression tests
+        run: vp test run apps/server/src/provider/Layers/ClaudeAdapter.usageRegression.test.ts
