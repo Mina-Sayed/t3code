@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   regression:
-    if: contains(github.event.head_commit.message, '#8617 production fix')
+    if: ${{ contains(github.event.head_commit.message, '8617 production fix') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
