@@ -6,20 +6,76 @@ on:
       - main
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   regression:
+    if: contains(github.event.head_commit.message, '#8617 production fix')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
         with:
           ref: fix/claude-meter-8594
+          fetch-depth: 0
+
+      - name: Apply minimal current-turn usage fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/pingdotgg/t3code.git 2>/dev/null || true
+          git fetch upstream main
+          git checkout upstream/main -- apps/server/src/provider/Layers/ClaudeAdapter.ts
+
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("apps/server/src/provider/Layers/ClaudeAdapter.ts")
+          text = path.read_text()
+          old = '''      const snapshot = normalizeClaudeActiveTokenUsage(
+        event.usage,
+        context.lastKnownContextWindow,
+        context.lastKnownTotalProcessedTokens,
+      );
+      yield* emitThreadTokenUsage(context, snapshot, {
+'''
+          new = '''      const snapshot = normalizeClaudeActiveTokenUsage(
+        event.usage,
+        context.lastKnownContextWindow,
+        context.lastKnownTotalProcessedTokens,
+      );
+      if (snapshot !== undefined && context.turnState) {
+        context.turnState.latestAssistantUsage = event.usage;
+        context.turnState.compactedSinceLatestAssistantUsage = false;
+      }
+      yield* emitThreadTokenUsage(context, snapshot, {
+'''
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f"expected one parent message_delta usage block, found {count}")
+          path.write_text(text.replace(old, new))
+          PY
+
+          git diff --check
+
       - uses: voidzero-dev/setup-vp@v1
         with:
           node-version-file: package.json
           cache: true
           run-install: true
-      - name: Run Claude usage regression tests
-        run: vp test run apps/server/src/provider/Layers/ClaudeAdapter.usageRegression.test.ts
+
+      - name: Run focused Claude adapter tests
+        run: >-
+          vp test run
+          apps/server/src/provider/Layers/ClaudeAdapter.usageRegression.test.ts
+          apps/server/src/provider/Layers/ClaudeAdapter.test.ts
+
+      - name: Commit validated fix to PR branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Mina Sayed"
+          git config user.email "26074858+Mina-Sayed@users.noreply.github.com"
+          git add apps/server/src/provider/Layers/ClaudeAdapter.ts
+          git commit -m "fix(server): track parent Claude delta usage per turn"
+          git push origin HEAD:fix/claude-meter-8594
