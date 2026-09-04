@@ -214,4 +214,110 @@ describe("ClaudeAdapter cumulative usage regression", () => {
       Effect.provide(harness.layer),
     );
   });
+
+  it.effect("uses the current result when a later turn has no message_delta", () => {
+    const harness = makeHarness();
+
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeUsageRegressionAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      const firstTurnEvents = yield* adapter.streamEvents.pipe(
+        Stream.takeUntil((event) => event.type === "turn.completed"),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.sendTurn({ threadId: THREAD_ID, input: "first", attachments: [] });
+      harness.query.emit({
+        type: "stream_event",
+        session_id: "sdk-session-stale-usage",
+        uuid: "message-delta-first-turn",
+        parent_tool_use_id: null,
+        event: {
+          type: "message_delta",
+          delta: { stop_reason: null, stop_sequence: null },
+          usage: {
+            input_tokens: 100000,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 12994,
+            output_tokens: 0,
+          },
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        duration_ms: 100,
+        duration_api_ms: 90,
+        num_turns: 1,
+        result: "first done",
+        stop_reason: "end_turn",
+        session_id: "sdk-session-stale-usage",
+        usage: {
+          input_tokens: 100000,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 12994,
+          output_tokens: 0,
+          total_tokens: 112994,
+          iterations: [],
+        },
+        modelUsage: {
+          "claude-opus-4-6": { contextWindow: 1000000, maxOutputTokens: 64000 },
+        },
+      } as unknown as SDKMessage);
+      yield* Fiber.join(firstTurnEvents);
+
+      const secondTurnEvents = yield* adapter.streamEvents.pipe(
+        Stream.takeUntil((event) => event.type === "turn.completed"),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.sendTurn({ threadId: THREAD_ID, input: "second", attachments: [] });
+      // No message_delta or assistant snapshot is emitted for this turn. The
+      // result is therefore the only current-turn active-usage reading and
+      // must beat the session-wide lastKnownTokenUsage from the prior turn.
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        duration_ms: 100,
+        duration_api_ms: 90,
+        num_turns: 1,
+        result: "second done",
+        stop_reason: "end_turn",
+        session_id: "sdk-session-stale-usage",
+        usage: {
+          input_tokens: 200000,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 10000,
+          output_tokens: 5000,
+          total_tokens: 215000,
+          iterations: [],
+        },
+        modelUsage: {
+          "claude-opus-4-6": { contextWindow: 1000000, maxOutputTokens: 64000 },
+        },
+      } as unknown as SDKMessage);
+      harness.query.finish();
+
+      const events = Array.from(yield* Fiber.join(secondTurnEvents));
+      const finalUsage = events.findLast(
+        (event) => event.type === "thread.token-usage.updated",
+      );
+      assert.equal(finalUsage?.type, "thread.token-usage.updated");
+      if (finalUsage?.type === "thread.token-usage.updated") {
+        assert.equal(finalUsage.payload.usage.usedTokens, 215000);
+        assert.equal(finalUsage.payload.usage.inputTokens, 210000);
+        assert.equal(finalUsage.payload.usage.outputTokens, 5000);
+      }
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
 });
