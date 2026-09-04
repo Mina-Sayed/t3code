@@ -4,11 +4,7 @@ import type {
   SDKMessage,
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import {
-  ClaudeSettings,
-  ProviderDriverKind,
-  ThreadId,
-} from "@t3tools/contracts";
+import { ClaudeSettings, ProviderDriverKind, ThreadId } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -192,9 +188,7 @@ describe("ClaudeAdapter cumulative usage regression", () => {
       harness.query.finish();
 
       const events = Array.from(yield* Fiber.join(eventsFiber));
-      const finalUsage = events.findLast(
-        (event) => event.type === "thread.token-usage.updated",
-      );
+      const finalUsage = events.findLast((event) => event.type === "thread.token-usage.updated");
       assert.equal(finalUsage?.type, "thread.token-usage.updated");
       if (finalUsage?.type === "thread.token-usage.updated") {
         assert.deepEqual(finalUsage.payload.usage, {
@@ -306,9 +300,7 @@ describe("ClaudeAdapter cumulative usage regression", () => {
       harness.query.finish();
 
       const events = Array.from(yield* Fiber.join(secondTurnEvents));
-      const finalUsage = events.findLast(
-        (event) => event.type === "thread.token-usage.updated",
-      );
+      const finalUsage = events.findLast((event) => event.type === "thread.token-usage.updated");
       assert.equal(finalUsage?.type, "thread.token-usage.updated");
       if (finalUsage?.type === "thread.token-usage.updated") {
         assert.equal(finalUsage.payload.usage.usedTokens, 215000);
