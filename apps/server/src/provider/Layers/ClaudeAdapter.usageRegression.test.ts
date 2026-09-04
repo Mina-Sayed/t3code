@@ -1,4 +1,3 @@
-// @effect-diagnostics nodeBuiltinImport:off
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import type {
   Options as ClaudeQueryOptions,
@@ -74,6 +73,7 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
   }
 }
 
+/** Builds the minimal live adapter layer needed to drive SDK messages through completeTurn. */
 function makeHarness() {
   const query = new FakeClaudeQuery();
   let createInput:
@@ -102,6 +102,7 @@ function makeHarness() {
   return { layer, query, getCreateInput: () => createInput };
 }
 
+/** Returns a deterministic Random service so runtime event ids are stable in the test harness. */
 function makeDeterministicRandomService(seed = 0x1234_5678): {
   nextIntUnsafe: () => number;
   nextDoubleUnsafe: () => number;
