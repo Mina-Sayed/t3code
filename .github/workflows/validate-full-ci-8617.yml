@@ -2,9 +2,9 @@
 name: Validate Full CI 8617
 
 on:
-  push:
+  pull_request:
     branches:
-      - main
+      - tmp/rebase-8617
 
 permissions:
   contents: read
