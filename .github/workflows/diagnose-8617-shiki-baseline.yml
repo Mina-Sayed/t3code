@@ -1,0 +1,39 @@
+name: Diagnose #8617 Shiki Baseline
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/diagnose-8617-shiki-baseline.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shiki-baseline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout baseline without #8617
+        uses: actions/checkout@v6
+        with:
+          ref: 2705aa2c886ba27dfe79121ab80831931999fe96
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Match desktop CI prerequisites
+        run: |
+          vp run --filter @t3tools/desktop ensure:electron
+          sudo apt-get update
+          sudo apt-get install -y libsecret-1-dev pkg-config
+
+      - name: Run Shiki baseline test
+        working-directory: apps/desktop
+        run: vp test run src/features/review/shikiReviewHighlighter.test.ts
