@@ -25,7 +25,7 @@ const THREAD_ID = ThreadId.make("thread-claude-usage-regression");
 class ClaudeUsageRegressionAdapter extends Context.Service<
   ClaudeUsageRegressionAdapter,
   ClaudeAdapterShape
->()("t3/provider/Layers/ClaudeAdapter.usageRegression.test/ClaudeAdapter") {}
+>()("t3/provider/Layers/ClaudeAdapter.usageRegression.test/ClaudeUsageRegressionAdapter") {}
 
 class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
   private readonly queue: Array<SDKMessage> = [];
