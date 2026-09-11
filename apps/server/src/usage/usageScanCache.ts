@@ -159,13 +159,15 @@ export function decodeScanCache(document: unknown): ScanCache {
   const models = root.models as readonly string[];
   const sessions = root.sessions as readonly string[];
 
-  // Any corrupt row disqualifies the whole entry. Keeping the survivors
-  // under the original (size, mtime) would read as a valid warm hit and the
-  // file would never be re-parsed, silently losing the dropped rows' usage.
-  const decodeRecords = (
-    rows: readonly unknown[],
-    provider: UsageProviderKind,
-  ): UsageRecord[] | null => {
+  for (const [path, raw] of Object.entries(root.files)) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const entry = raw as Partial<SerializedFile>;
+    if (typeof entry.s !== "number" || typeof entry.m !== "number") continue;
+    if (entry.p !== "claude" && entry.p !== "codex" && entry.p !== "grok" && entry.p !== "opencode")
+      continue;
+    if (!isRecordArray(entry.r)) continue;
+
+    const provider: UsageProviderKind = entry.p;
     const records: UsageRecord[] = [];
     for (const row of rows) {
       if (!isRecordArray(row) || row.length < 10) return null;

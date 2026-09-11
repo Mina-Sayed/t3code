@@ -6,6 +6,7 @@ import {
   parseClaudeLine,
   parseCodexLine,
   parseGrokLine,
+  parseOpenCodeMessage,
   totalTokens,
 } from "./usageTranscripts.ts";
 
@@ -562,5 +563,141 @@ describe("parseGrokLine", () => {
 
     const records = parseGrokLine(line);
     expect(records[0]?.timestampMs).toBe(1_786_372_566_000);
+  });
+});
+
+describe("parseOpenCodeMessage", () => {
+  function openCodeData(overrides: Record<string, unknown> = {}): string {
+    return JSON.stringify({
+      role: "assistant",
+      tokens: { input: 100, output: 50, reasoning: 20, cache: { read: 30, write: 10 } },
+      modelID: "mimo-v2.5-free",
+      providerID: "opencode",
+      time: { created: 1_786_372_566_000, completed: 1_786_372_567_000 },
+      cost: 0.002,
+      ...overrides,
+    });
+  }
+
+  it("extracts token totals with input cache-exclusive", () => {
+    const record = parseOpenCodeMessage(openCodeData(), "msg_1", "ses_1");
+    expect(record).not.toBeNull();
+    expect(record?.provider).toBe("opencode");
+    expect(record?.model).toBe("opencode/mimo-v2.5-free");
+    // input is exclusive, not input - cache
+    expect(record?.totals).toEqual({
+      uncachedInputTokens: 100,
+      cachedInputTokens: 30,
+      cacheCreationTokens: 10,
+      outputTokens: 50,
+      reasoningTokens: 20,
+    });
+    expect(record?.dedupeKey).toBe("msg_1");
+  });
+
+  it("returns null for user or non-assistant rows", () => {
+    expect(parseOpenCodeMessage(openCodeData({ role: "user" }), "msg_1", "ses_1")).toBeNull();
+    expect(
+      parseOpenCodeMessage(JSON.stringify({ role: "assistant" }), "msg_1", "ses_1"),
+    ).toBeNull();
+    expect(parseOpenCodeMessage("not json", "msg_1", "ses_1")).toBeNull();
+  });
+
+  it("clamps reasoningTokens to outputTokens", () => {
+    const record = parseOpenCodeMessage(
+      openCodeData({
+        tokens: { input: 10, output: 5, reasoning: 100, cache: { read: 0, write: 0 } },
+      }),
+      "msg_1",
+      "ses_1",
+    );
+    expect(record?.totals.reasoningTokens).toBe(5);
+  });
+
+  it("prefers time.completed over time.created, and falls back to column times", () => {
+    const withBoth = parseOpenCodeMessage(openCodeData(), "msg_1", "ses_1");
+    expect(withBoth?.timestampMs).toBe(1_786_372_567_000);
+
+    const withCreatedOnly = parseOpenCodeMessage(
+      openCodeData({ time: { created: 1_786_372_566_000 } }),
+      "msg_1",
+      "ses_1",
+    );
+    expect(withCreatedOnly?.timestampMs).toBe(1_786_372_566_000);
+
+    const withColumn = parseOpenCodeMessage(
+      JSON.stringify({
+        role: "assistant",
+        tokens: { input: 10, output: 5, cache: { read: 0, write: 0 } },
+        modelID: "m",
+        providerID: "opencode",
+      }),
+      "msg_1",
+      "ses_1",
+      undefined,
+      1_786_372_566_000,
+      1_786_372_567_000,
+    );
+    expect(withColumn?.timestampMs).toBe(1_786_372_567_000);
+
+    const noTime = parseOpenCodeMessage(
+      JSON.stringify({
+        role: "assistant",
+        tokens: { input: 10, output: 5, cache: { read: 0, write: 0 } },
+        modelID: "m",
+        providerID: "opencode",
+      }),
+      "msg_1",
+      "ses_1",
+    );
+    expect(noTime).toBeNull();
+  });
+
+  it("rejects zero-token rows", () => {
+    expect(
+      parseOpenCodeMessage(
+        openCodeData({
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        }),
+        "msg_1",
+        "ses_1",
+      ),
+    ).toBeNull();
+  });
+
+  it("falls back to null dedupeKey on empty message id", () => {
+    const record = parseOpenCodeMessage(openCodeData(), "", "ses_1");
+    expect(record?.dedupeKey).toBeNull();
+  });
+
+  it("handles V2 nested model and type column", () => {
+    const v2Data = JSON.stringify({
+      tokens: { input: 200, output: 100, reasoning: 10, cache: { read: 50, write: 5 } },
+      model: { id: "claude-sonnet-4", providerID: "anthropic" },
+      time: { completed: 1_786_372_567_000 },
+      cost: 0.01,
+    });
+    const record = parseOpenCodeMessage(
+      v2Data,
+      "msg_v2",
+      "ses_v2",
+      "assistant",
+      undefined,
+      1_786_372_567_000,
+    );
+    expect(record).not.toBeNull();
+    expect(record?.model).toBe("anthropic/claude-sonnet-4");
+    expect(record?.provider).toBe("opencode");
+  });
+
+  it("uses column type for V2 and ignores non-assistant", () => {
+    const data = JSON.stringify({
+      tokens: { input: 10, output: 5, cache: { read: 0, write: 0 } },
+      modelID: "m",
+      providerID: "opencode",
+      time: { completed: 1_786_372_567_000 },
+    });
+    expect(parseOpenCodeMessage(data, "msg_1", "ses_1", "user")).toBeNull();
+    expect(parseOpenCodeMessage(data, "msg_1", "ses_1", "assistant")).not.toBeNull();
   });
 });
