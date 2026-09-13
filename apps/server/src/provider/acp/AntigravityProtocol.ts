@@ -72,9 +72,7 @@ const decodeSecurityWarning = Schema.decodeUnknownOption(
  * The agent marks "Allow Always" on shell and web tools with a prompt injection
  * warning in `_meta`. Surface it as option text so both clients can show it.
  */
-export function antigravitySecurityWarning(
-  option: EffectAcpSchema.PermissionOption,
-): string | undefined {
+function antigravitySecurityWarning(option: EffectAcpSchema.PermissionOption): string | undefined {
   const meta = option._meta;
   if (!Predicate.isObject(meta)) return undefined;
   const warning = Option.getOrUndefined(decodeSecurityWarning(meta[SECURITY_WARNING_META_KEY]));
@@ -376,7 +374,7 @@ export function isAntigravitySubagentReplayStart(rawPayload: unknown): boolean {
   );
 }
 
-export function antigravitySubagentResult(toolCall: AcpToolCallState): string | undefined {
+export function antigravitySubagentOutput(toolCall: AcpToolCallState): string | undefined {
   const output = toolCall.data.rawOutput;
   return typeof output === "string" && output.trim() ? boundText(output.trim()) : undefined;
 }
