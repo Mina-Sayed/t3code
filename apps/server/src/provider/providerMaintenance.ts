@@ -17,6 +17,8 @@ import { HttpClient, HttpClientRequest } from "effect/unstable/http";
 const LATEST_VERSION_CACHE_TTL_MS = 60 * 60 * 1_000;
 const LATEST_VERSION_TIMEOUT_MS = 4_000;
 const PROVIDER_UPDATE_ACTION_TOAST_MESSAGE = "Install the update now or review provider settings.";
+const MISE_WRAPPER_MAX_BYTES = 16 * 1_024;
+const MISE_WRAPPER_PATTERN = /\bmise\s+(?:x|exec)\b/;
 
 const compactEnv = (input: Record<string, Option.Option<string>>): NodeJS.ProcessEnv =>
   Object.fromEntries(
@@ -273,6 +275,12 @@ function isHomebrewCommandPath(commandPath: string): boolean {
   );
 }
 
+/** Version-manager installs are pinned in its config, so updating them means editing that. */
+function isMiseCommandPath(commandPath: string): boolean {
+  const normalized = normalizeCommandPath(commandPath);
+  return normalized.includes("/mise/installs/") || normalized.includes("/mise/shims/");
+}
+
 export function resolvePackageManagedProviderMaintenance(
   definition: PackageManagedProviderMaintenanceDefinition,
   options?: ProviderMaintenanceCapabilityResolutionOptions,
@@ -292,6 +300,17 @@ export function resolvePackageManagedProviderMaintenance(
     ];
 
     const nativeUpdate = definition.nativeUpdate;
+    // Version-manager installs are pinned in the manager's config: neither
+    // the provider's own updater (e.g. `claude update` refuses a
+    // mise-managed install with "managed by a package manager" yet still
+    // exits 0) nor any package manager owns that path, so one-click updates
+    // stay manual instead of reporting a success that changed nothing.
+    if (commandPaths.some(isMiseCommandPath)) {
+      return makeManualOnlyProviderMaintenanceCapabilities({
+        provider: definition.provider,
+        packageName: definition.npmPackageName,
+      });
+    }
     if (
       nativeUpdate &&
       commandPaths.some((commandPath) => nativeUpdate.isCommandPath(commandPath))
@@ -377,12 +396,29 @@ export const resolveProviderMaintenanceCapabilitiesEffect = Effect.fn(
   const realCommandPath = yield* fileSystem
     .realPath(resolvedCommandPath)
     .pipe(Effect.orElseSucceed(() => resolvedCommandPath));
-  return resolver.resolve({
+  // A launcher script that runs the provider through mise (`mise x <tool> -- <tool>`)
+  // may live at a native-looking path such as `~/.local/bin/claude`. The
+  // provider's own updater cannot update that install (it exits 0 without
+  // changing anything), so one-click updates stay manual.
+  const isMiseWrapper = yield* fileSystem
+    .stat(realCommandPath)
+    .pipe(
+      Effect.flatMap((info) =>
+        Number(info.size) > MISE_WRAPPER_MAX_BYTES
+          ? Effect.succeed(false)
+          : fileSystem.readFileString(realCommandPath).pipe(
+              Effect.map((source) => source.startsWith("#!") && MISE_WRAPPER_PATTERN.test(source)),
+            ),
+      ),
+      Effect.orElseSucceed(() => false),
+    );
+  const capabilities = resolver.resolve({
     ...options,
     env,
     resolvedCommandPath,
     realCommandPath,
   });
+  return isMiseWrapper ? { ...capabilities, update: null } : capabilities;
 });
 
 function deriveVersionAdvisory(input: {

@@ -597,4 +597,49 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
       update: null,
     });
   });
+
+  it("disables one-click updates for version-manager installs under mise", () => {
+    for (const binaryPath of [
+      "/home/user/.local/share/mise/installs/package-tool/1.0.0/bin/package-tool",
+      "/home/user/.local/share/mise/shims/package-tool",
+    ]) {
+      expect(packageToolUpdate.resolve({ binaryPath, env: { PATH: "" } })).toEqual({
+        provider: driver("packageTool"),
+        packageName: "@example/package-tool",
+        update: null,
+      });
+    }
+  });
+
+  it.effect(
+    "disables one-click native updates for mise wrapper scripts at native-looking paths",
+    () =>
+      Effect.gen(function* () {
+        const tempDir = yield* makeTempDir("t3-mise-wrapper-capabilities");
+        const nativeBinDir = NodePath.join(tempDir, ".local", "bin");
+        NodeFS.mkdirSync(nativeBinDir, { recursive: true });
+        const wrapperPath = NodePath.join(nativeBinDir, "native-package-tool");
+        NodeFS.writeFileSync(
+          wrapperPath,
+          '#!/bin/bash\nmise use -g --quiet "native-package-tool" || exit 1\nexec mise x "native-package-tool" -- "native-package-tool" "$@"\n',
+        );
+        NodeFS.chmodSync(wrapperPath, 0o755);
+
+        const capabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(
+          nativePackageToolUpdate,
+          {
+            binaryPath: wrapperPath,
+            env: {
+              PATH: "",
+            },
+          },
+        ).pipe(Effect.provideService(HostProcessPlatform, "darwin"));
+
+        expect(capabilities).toEqual({
+          provider: driver("nativePackageTool"),
+          packageName: "@example/native-package-tool",
+          update: null,
+        });
+      }),
+  );
 });
